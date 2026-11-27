@@ -16,6 +16,7 @@ import { writeIdSet } from './ids.js'
  * @function
  */
 export const writeStructs = (encoder, structs, client, idranges) => {
+  if (structs.length === 0) return
   let structsToWrite = 0 // this accounts for the skips
   /**
    * @type {Array<{ start: number, end: number, startClock: number, endClock: number }>}
@@ -32,6 +33,9 @@ export const writeStructs = (encoder, structs, client, idranges) => {
     const start = findIndexSS(structs, startClock)
     // exclusive end
     const end = findIndexSS(structs, endClock - 1) + 1
+    if (indexRanges.length > 0 && startClock > indexRanges[indexRanges.length - 1].endClock) {
+      structsToWrite++
+    }
     structsToWrite += end - start
     indexRanges.push({
       start,
@@ -40,7 +44,7 @@ export const writeStructs = (encoder, structs, client, idranges) => {
       endClock
     })
   })
-  structsToWrite += idranges.length - 1
+  if (indexRanges.length === 0) return
   // start writing with this clock. this is updated to the next clock that we expect to write
   let clock = indexRanges[0].startClock
   // write # encoded structs
@@ -75,13 +79,27 @@ export const writeStructs = (encoder, structs, client, idranges) => {
  * @function
  */
 export const writeStructsFromIdSet = (encoder, store, idset) => {
+  /**
+   * @type {Array<[number, Array<GC|Item|Skip>, Array<IdRange>]>}
+   */
+  const clientEntries = []
+  idset.clients.forEach((ids, client) => {
+    const structs = store.clients.get(client)
+    if (structs == null || structs.length === 0) return
+    const idRanges = ids.getIds()
+    if (idRanges.length === 0) return
+    const firstPossibleClock = structs[0].id.clock
+    const lastStruct = array.last(structs)
+    const lastPossibleClock = lastStruct.id.clock + lastStruct.length
+    if (idRanges.some(idrange => math.max(idrange.clock, firstPossibleClock) < math.min(idrange.clock + idrange.len, lastPossibleClock))) {
+      clientEntries.push([client, structs, idRanges])
+    }
+  })
   // write # states that were updated
-  encoding.writeVarUint(encoder.restEncoder, idset.clients.size)
+  encoding.writeVarUint(encoder.restEncoder, clientEntries.length)
   // Write items with higher client ids first
   // This heavily improves the conflict algorithm.
-  array.from(idset.clients.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, ids]) => {
-    const idRanges = ids.getIds()
-    const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
+  clientEntries.sort((a, b) => b[0] - a[0]).forEach(([client, structs, idRanges]) => {
     writeStructs(encoder, structs, client, idRanges)
   })
 }

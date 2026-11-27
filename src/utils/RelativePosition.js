@@ -234,7 +234,10 @@ export const readRelativePosition = decoder => {
     case 2: {
       // case 3: found position at the end of the list and type is attached to an item
       type = readID(decoder)
+      break
     }
+    default:
+      throw error.unexpectedCase()
   }
   const assoc = decoding.hasContent(decoder) ? decoding.readVarInt(decoder) : 0
   return new RelativePosition(type, tname, itemID, assoc)

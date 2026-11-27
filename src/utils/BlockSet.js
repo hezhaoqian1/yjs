@@ -3,6 +3,7 @@ import * as binary from 'lib0/binary'
 import * as map from 'lib0/map'
 import * as array from 'lib0/array'
 import * as encoding from 'lib0/encoding'
+import * as error from 'lib0/error'
 import * as number from 'lib0/number'
 import * as math from 'lib0/math'
 
@@ -15,6 +16,10 @@ import { createIdSet, IdRange } from './ids.js'
 import { sliceStruct } from './updates.js'
 import { GC } from '../structs/GC.js'
 import { writeStructs } from './encoding-helpers.js'
+import { UpdateDecoderV1 } from './UpdateDecoder.js'
+
+const maxV2BlocksBase = 16384
+const maxV2BlocksPerByte = 256
 
 /**
  * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder The decoder object to read data from.
@@ -25,29 +30,58 @@ import { writeStructs } from './encoding-helpers.js'
  */
 export const readBlockSet = (decoder) => {
   const clientRefs = new BlockSet()
-  const numOfStateUpdates = decoding.readVarUint(decoder.restDecoder)
+  const restDecoder = decoder.restDecoder
+  const numOfStateUpdates = decoding.readVarUint(restDecoder)
+  if (numOfStateUpdates * 2 > restDecoder.arr.length - restDecoder.pos) {
+    throw error.create('Unexpected end of array')
+  }
+  const isV1 = decoder instanceof UpdateDecoderV1
+  const maxBlocks = isV1 ? 0 : math.max(maxV2BlocksBase, restDecoder.arr.length * maxV2BlocksPerByte)
+  let totalBlocks = 0
   for (let i = 0; i < numOfStateUpdates; i++) {
-    const numberOfBlocks = decoding.readVarUint(decoder.restDecoder)
+    const numberOfBlocks = decoding.readVarUint(restDecoder)
+    const client = decoder.readClient()
+    let clock = decoding.readVarUint(restDecoder)
+    if (client > number.MAX_SAFE_INTEGER || clock > number.MAX_SAFE_INTEGER || clientRefs.clients.has(client)) {
+      throw error.unexpectedCase()
+    }
+    if (isV1) {
+      if (numberOfBlocks * 2 > restDecoder.arr.length - restDecoder.pos) {
+        throw error.create('Unexpected end of array')
+      }
+    } else {
+      totalBlocks += numberOfBlocks
+      if (totalBlocks > maxBlocks) {
+        throw error.create('Update exceeds maximum block limit')
+      }
+    }
+    if (numberOfBlocks === 0) {
+      continue
+    }
     /**
      * @type {Array<GC|Item|Skip>}
      */
-    const refs = new Array(numberOfBlocks)
-    const client = decoder.readClient()
-    let clock = decoding.readVarUint(decoder.restDecoder)
+    const refs = []
     clientRefs.clients.set(client, new BlockRange(refs))
-    for (let i = 0; i < numberOfBlocks; i++) {
+    for (let j = 0; j < numberOfBlocks; j++) {
       const info = decoder.readInfo()
       switch (binary.BITS5 & info) {
         case 0: { // GC
           const len = decoder.readLen()
-          refs[i] = new GC(createID(client, clock), len)
+          if (len <= 0 || len > number.MAX_SAFE_INTEGER - clock) {
+            throw error.unexpectedCase()
+          }
+          refs.push(new GC(createID(client, clock), len))
           clock += len
           break
         }
         case 10: { // Skip Block (nothing to apply)
           // @todo we could reduce the amount of checks by adding Skip block to clientRefs so we know that something is missing.
-          const len = decoding.readVarUint(decoder.restDecoder)
-          refs[i] = new Skip(createID(client, clock), len)
+          const len = decoding.readVarUint(restDecoder)
+          if (len <= 0 || len > number.MAX_SAFE_INTEGER - clock) {
+            throw error.unexpectedCase()
+          }
+          refs.push(new Skip(createID(client, clock), len))
           clock += len
           break
         }
@@ -72,7 +106,10 @@ export const readBlockSet = (decoder) => {
             cantCopyParentInfo && (info & binary.BIT6) === binary.BIT6 ? decoder.readString() : null, // parentSub
             readItemContent(decoder, info) // item content
           )
-          refs[i] = block
+          if (block.length <= 0 || block.length > number.MAX_SAFE_INTEGER - clock) {
+            throw error.unexpectedCase()
+          }
+          refs.push(block)
           clock += block.length
         }
       }
@@ -86,11 +123,12 @@ export const readBlockSet = (decoder) => {
  * @param {BlockSet} blocks
  */
 export const writeBlockSet = (encoder, blocks) => {
+  const entries = array.from(blocks.clients.entries()).filter(([, blockrange]) => blockrange.refs.length > 0)
   // write # states that were updated
-  encoding.writeVarUint(encoder.restEncoder, blocks.clients.size)
+  encoding.writeVarUint(encoder.restEncoder, entries.length)
   // Write items with higher client ids first
   // This heavily improves the conflict algorithm.
-  array.from(blocks.clients.entries()).sort((a, b) => b[0] - a[0]).forEach(([client, blockrange]) => {
+  entries.sort((a, b) => b[0] - a[0]).forEach(([client, blockrange]) => {
     writeStructs(encoder, blockrange.refs, client, [new IdRange(0, number.MAX_SAFE_INTEGER)])
   })
 }
@@ -147,7 +185,7 @@ export class BlockSet {
     for (const client of clientids) {
       const range = exclude.clients.get(client)
       const structs = this.clients.get(client)?.refs
-      if (range == null || structs == null) continue
+      if (range == null || structs == null || structs.length === 0) continue
       const startClock = structs[0].id.clock
       const idranges = range.getIds()
       for (let i = 0; i < idranges.length; i++) {
@@ -183,8 +221,9 @@ export class BlockSet {
    */
   insertInto (inserts) {
     inserts.clients.forEach((newranges, clientid) => {
+      if (newranges.refs.length === 0) return
       const ranges = this.clients.get(clientid)
-      if (ranges == null) {
+      if (ranges == null || ranges.refs.length === 0) {
         this.clients.set(clientid, newranges)
       } else {
         const localIsLeft = ranges.refs[0].id.clock < newranges.refs[0].id.clock
@@ -265,7 +304,11 @@ export class BlockSet {
             result.push(lblock)
             clock = end + lblock.length
           }
-          ranges.refs = result
+          if (result.length === 0) {
+            this.clients.delete(clientid)
+          } else {
+            ranges.refs = result
+          }
         }
       }
     })

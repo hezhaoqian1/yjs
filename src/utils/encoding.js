@@ -16,13 +16,15 @@
 
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
+import * as error from 'lib0/error'
 import * as map from 'lib0/map'
 import * as math from 'lib0/math'
+import * as number from 'lib0/number'
 import * as array from 'lib0/array'
 
 import { getStateVector, StructStore } from './StructStore.js'
 import { getItemCleanStart, getItemCleanEnd } from './transaction-helpers.js'
-import { createIdSet, IdRange, readAndApplyDeleteSet, readIdSet, mergeIdSets, writeIdSet } from './ids.js'
+import { applyDeleteSet, createIdSet, IdRange, readAndApplyDeleteSet, readIdSet, mergeIdSets, writeIdSet } from './ids.js'
 import { createID, ID } from './ID.js'
 import { UpdateDecoderV1, UpdateDecoderV2, IdSetDecoderV1 } from './UpdateDecoder.js'
 import { UpdateEncoderV1, UpdateEncoderV2, IdSetEncoderV1, IdSetEncoderV2 } from './UpdateEncoder.js'
@@ -243,15 +245,18 @@ const integrateStructs = (transaction, store, clientsStructRefs) => {
  *
  * @function
  */
-export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = new UpdateDecoderV2(decoder)) =>
-  ydoc.transact(transaction => {
+export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = new UpdateDecoderV2(decoder)) => {
+  // Decode the full update (both structs and delete set) before starting a transaction or
+  // mutating `doc.store`, so malformed/truncated updates fail atomically without partial state.
+  const ss = readBlockSet(structDecoder)
+  const ds = readIdSet(structDecoder)
+  return ydoc.transact(transaction => {
     // force that transaction.local is set to non-local
     transaction.local = false
     let retry = false
     const doc = transaction.doc
     const store = doc.store
     // let start = performance.now()
-    const ss = readBlockSet(structDecoder)
     const knownState = createIdSet()
     ss.clients.forEach((_, client) => {
       const storeStructs = store.clients.get(client)
@@ -295,7 +300,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
     }
     // console.log('time to integrate: ', performance.now() - start) // @todo remove
     // start = performance.now()
-    const dsRest = readAndApplyDeleteSet(structDecoder, transaction, store)
+    const dsRest = applyDeleteSet(ds, transaction, store)
     if (store.pendingDs) {
       // @todo we could make a lower-bound state-vector check as we do above
       const pendingDSUpdate = new UpdateDecoderV2(decoding.createDecoder(store.pendingDs))
@@ -325,6 +330,7 @@ export const readUpdateV2 = (decoder, ydoc, transactionOrigin, structDecoder = n
       applyUpdateV2(transaction.doc, update)
     }
   }, transactionOrigin, false)
+}
 
 /**
  * Read and apply a document update.
@@ -442,10 +448,17 @@ export const encodeStateAsUpdate = (doc, encodedTargetStateVector) => encodeStat
  */
 export const readStateVector = decoder => {
   const ss = new Map()
-  const ssLength = decoding.readVarUint(decoder.restDecoder)
+  const restDecoder = decoder.restDecoder
+  const ssLength = decoding.readVarUint(restDecoder)
+  if (ssLength * 2 > restDecoder.arr.length - restDecoder.pos) {
+    throw error.create('Unexpected end of array')
+  }
   for (let i = 0; i < ssLength; i++) {
-    const client = decoding.readVarUint(decoder.restDecoder)
-    const clock = decoding.readVarUint(decoder.restDecoder)
+    const client = decoding.readVarUint(restDecoder)
+    const clock = decoding.readVarUint(restDecoder)
+    if (client > number.MAX_SAFE_INTEGER || clock > number.MAX_SAFE_INTEGER || ss.has(client)) {
+      throw error.unexpectedCase()
+    }
     ss.set(client, clock)
   }
   return ss

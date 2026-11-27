@@ -5,6 +5,8 @@ import * as error from 'lib0/error'
 import * as f from 'lib0/function'
 import * as logging from 'lib0/logging'
 import * as map from 'lib0/map'
+import * as math from 'lib0/math'
+import * as number from 'lib0/number'
 import * as string from 'lib0/string'
 
 import { readIdSet, writeIdSet, createIdSet, intersectSets } from './ids.js'
@@ -30,45 +32,89 @@ import {
 } from '../ynode.js'
 import { Skip } from '../structs/Skip.js'
 
+const maxV2StructsBase = 16384
+const maxV2StructsPerByte = 256
+
 /**
  * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder
  */
 function * lazyStructReaderGenerator (decoder) {
-  const numOfStateUpdates = decoding.readVarUint(decoder.restDecoder)
+  const restDecoder = decoder.restDecoder
+  const numOfStateUpdates = decoding.readVarUint(restDecoder)
+  if (numOfStateUpdates * 2 > restDecoder.arr.length - restDecoder.pos) {
+    throw error.create('Unexpected end of array')
+  }
+  const isV1 = decoder instanceof UpdateDecoderV1
+  const maxStructs = isV1 ? 0 : math.max(maxV2StructsBase, restDecoder.arr.length * maxV2StructsPerByte)
+  let totalStructs = 0
+  /**
+   * @type {Set<number>}
+   */
+  const seenClients = new Set()
   for (let i = 0; i < numOfStateUpdates; i++) {
-    const numberOfStructs = decoding.readVarUint(decoder.restDecoder)
+    const numberOfStructs = decoding.readVarUint(restDecoder)
     const client = decoder.readClient()
-    let clock = decoding.readVarUint(decoder.restDecoder)
-    for (let i = 0; i < numberOfStructs; i++) {
+    let clock = decoding.readVarUint(restDecoder)
+    if (client > number.MAX_SAFE_INTEGER || clock > number.MAX_SAFE_INTEGER || seenClients.has(client)) {
+      throw error.unexpectedCase()
+    }
+    if (isV1) {
+      if (numberOfStructs * 2 > restDecoder.arr.length - restDecoder.pos) {
+        throw error.create('Unexpected end of array')
+      }
+    } else {
+      totalStructs += numberOfStructs
+      if (totalStructs > maxStructs) {
+        throw error.create('Update exceeds maximum block limit')
+      }
+    }
+    if (numberOfStructs === 0) {
+      continue
+    }
+    seenClients.add(client)
+    for (let j = 0; j < numberOfStructs; j++) {
       const info = decoder.readInfo()
-      // @todo use switch instead of ifs
-      if (info === 10) {
-        const len = decoding.readVarUint(decoder.restDecoder)
-        yield new Skip(createID(client, clock), len)
-        clock += len
-      } else if ((binary.BITS5 & info) !== 0) {
-        const cantCopyParentInfo = (info & (binary.BIT7 | binary.BIT8)) === 0
-        // If parent = null and neither left nor right are defined, then we know that `parent` is child of `y`
-        // and we read the next string as parentYKey.
-        // It indicates how we store/retrieve parent from `y.share`
-        // @type {string|null}
-        const struct = new Item(
-          createID(client, clock),
-          null, // left
-          (info & binary.BIT8) === binary.BIT8 ? decoder.readLeftID() : null, // origin
-          null, // right
-          (info & binary.BIT7) === binary.BIT7 ? decoder.readRightID() : null, // right origin
-          // @ts-ignore Force writing a string here.
-          cantCopyParentInfo ? (decoder.readParentInfo() ? decoder.readString() : decoder.readLeftID()) : null, // parent
-          cantCopyParentInfo && (info & binary.BIT6) === binary.BIT6 ? decoder.readString() : null, // parentSub
-          readItemContent(decoder, info) // item content
-        )
-        yield struct
-        clock += struct.length
-      } else {
-        const len = decoder.readLen()
-        yield new GC(createID(client, clock), len)
-        clock += len
+      switch (binary.BITS5 & info) {
+        case 0: { // GC
+          const len = decoder.readLen()
+          if (len <= 0 || len > number.MAX_SAFE_INTEGER - clock) {
+            throw error.unexpectedCase()
+          }
+          yield new GC(createID(client, clock), len)
+          clock += len
+          break
+        }
+        case 10: { // Skip
+          const len = decoding.readVarUint(restDecoder)
+          if (len <= 0 || len > number.MAX_SAFE_INTEGER - clock) {
+            throw error.unexpectedCase()
+          }
+          yield new Skip(createID(client, clock), len)
+          clock += len
+          break
+        }
+        default: { // Item with content
+          const cantCopyParentInfo = (info & (binary.BIT7 | binary.BIT8)) === 0
+          // If parent = null and neither left nor right are defined, then we know that `parent` is child of `y`
+          // and we read the next string as parentYKey.
+          // It indicates how we store/retrieve parent from `y.share`
+          // @type {string|null}
+          const struct = new Item(
+            createID(client, clock),
+            null, // left
+            (info & binary.BIT8) === binary.BIT8 ? decoder.readLeftID() : null, // origin
+            null, // right
+            (info & binary.BIT7) === binary.BIT7 ? decoder.readRightID() : null, // right origin
+            cantCopyParentInfo ? (decoder.readParentInfo() ? decoder.readString() : decoder.readLeftID()) : null, // parent
+            cantCopyParentInfo && (info & binary.BIT6) === binary.BIT6 ? decoder.readString() : null, // parentSub
+            readItemContent(decoder, info) // item content
+          )
+          if (struct.length <= 0 || struct.length > number.MAX_SAFE_INTEGER - clock) {
+            throw error.unexpectedCase()
+          }
+          yield struct
+          clock += struct.length
+        }
       }
     }
   }

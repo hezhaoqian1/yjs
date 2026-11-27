@@ -1,6 +1,7 @@
 import * as decoding from 'lib0/decoding'
 import * as encoding from 'lib0/encoding'
 import * as error from 'lib0/error'
+import * as number from 'lib0/number'
 
 export class ID {
   /**
@@ -62,8 +63,14 @@ export const writeID = (encoder, id) => {
  * @private
  * @function
  */
-export const readID = decoder =>
-  createID(decoding.readVarUint(decoder), decoding.readVarUint(decoder))
+export const readID = decoder => {
+  const client = decoding.readVarUint(decoder)
+  const clock = decoding.readVarUint(decoder)
+  if (client > number.MAX_SAFE_INTEGER || clock > number.MAX_SAFE_INTEGER) {
+    throw error.unexpectedCase()
+  }
+  return createID(client, clock)
+}
 
 /**
  * The top types are mapped from y.share.get(keyname) => type.

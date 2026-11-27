@@ -24,6 +24,7 @@ import {
   YXmlFragmentRefID,
   YXmlElementRefID,
   YXmlHookRefID,
+  YXmlTextRefID,
   ContentDoc,
   createContentDocFromDoc
 } from './structs/Item.js'
@@ -2789,7 +2790,13 @@ export const readContentType = decoder => new ContentType(readYNode(decoder))
  * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder
  * @return {ContentString}
  */
-export const readContentString = decoder => new ContentString(decoder.readString())
+export const readContentString = decoder => {
+  const str = decoder.readString()
+  if (str.length === 0) {
+    throw error.unexpectedCase()
+  }
+  return new ContentString(str)
+}
 
 /**
  * @private
@@ -2799,6 +2806,16 @@ export const readContentString = decoder => new ContentString(decoder.readString
  */
 export const readContentJSON = decoder => {
   const len = decoder.readLen()
+  if (len <= 0) {
+    throw error.unexpectedCase()
+  }
+  if ('stringDecoder' in decoder) {
+    if (len > decoder.stringDecoder.str.length - decoder.stringDecoder.spos) {
+      throw error.create('Unexpected end of array')
+    }
+  } else if (len * 2 > decoder.restDecoder.arr.length - decoder.restDecoder.pos) {
+    throw error.create('Unexpected end of array')
+  }
   const cs = []
   for (let i = 0; i < len; i++) {
     const c = decoder.readString()
@@ -2831,7 +2848,14 @@ export const readContentEmbed = decoder => new ContentEmbed(decoder.readJSON())
  * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder
  * @return {ContentDoc}
  */
-export const readContentDoc = decoder => new ContentDoc(decoder.readString(), decoder.readAny())
+export const readContentDoc = decoder => {
+  const guid = decoder.readString()
+  const opts = decoder.readAny()
+  if (opts === null || typeof opts !== 'object' || opts.constructor !== Object) {
+    throw error.unexpectedCase()
+  }
+  return new ContentDoc(guid, opts)
+}
 
 /**
  * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder
@@ -2839,6 +2863,12 @@ export const readContentDoc = decoder => new ContentDoc(decoder.readString(), de
  */
 export const readContentAny = decoder => {
   const len = decoder.readLen()
+  if (len <= 0) {
+    throw error.unexpectedCase()
+  }
+  if (len > decoder.restDecoder.arr.length - decoder.restDecoder.pos) {
+    throw error.create('Unexpected end of array')
+  }
   const cs = []
   for (let i = 0; i < len; i++) {
     cs.push(decoder.readAny())
@@ -2858,7 +2888,13 @@ export const readContentBinary = decoder => new ContentBinary(decoder.readBuf())
  * @param {UpdateDecoderV1 | UpdateDecoderV2 } decoder
  * @return {ContentDeleted}
  */
-export const readContentDeleted = decoder => new ContentDeleted(decoder.readLen())
+export const readContentDeleted = decoder => {
+  const len = decoder.readLen()
+  if (len <= 0) {
+    throw error.unexpectedCase()
+  }
+  return new ContentDeleted(len)
+}
 
 /**
  * A lookup map for reading Item content.
@@ -2883,7 +2919,13 @@ export const contentRefs = [
  * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder
  * @param {number} info
  */
-export const readItemContent = (decoder, info) => contentRefs[info & binary.BITS5](decoder)
+export const readItemContent = (decoder, info) => {
+  const ref = info & binary.BITS5
+  if (ref >= contentRefs.length) {
+    throw error.unexpectedCase()
+  }
+  return contentRefs[ref](decoder)
+}
 
 /**
  * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder
@@ -2894,6 +2936,9 @@ export const readItemContent = (decoder, info) => contentRefs[info & binary.BITS
  */
 export const readYNode = decoder => {
   const typeRef = decoder.readTypeRef()
+  if (typeRef < 0 || typeRef > YXmlTextRefID) {
+    throw error.unexpectedCase()
+  }
   const ynode = new YNode(typeRef === YXmlElementRefID || typeRef === YXmlHookRefID ? decoder.readKey() : null)
   ynode._legacyTypeRef = typeRef
   return ynode

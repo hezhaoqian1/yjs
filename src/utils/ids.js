@@ -2,6 +2,8 @@ import * as math from 'lib0/math'
 import * as traits from 'lib0/traits'
 import * as encoding from 'lib0/encoding'
 import * as decoding from 'lib0/decoding'
+import * as error from 'lib0/error'
+import * as number from 'lib0/number'
 import * as buf from 'lib0/buffer'
 import * as rabin from 'lib0/hash/rabin'
 import * as array from 'lib0/array'
@@ -10,7 +12,7 @@ import * as s from 'lib0/schema'
 
 import { iterateStructs, findIndexSS, iterateStructsWithoutSplits, tryGc } from './transaction-helpers.js'
 import { UpdateEncoderV2, IdSetEncoderV2 } from './UpdateEncoder.js'
-import { IdSetDecoderV2 } from './UpdateDecoder.js'
+import { IdSetDecoderV2, readSafeAny } from './UpdateDecoder.js'
 
 /**
  * @typedef {{ inserts: IdSet, deletes: IdSet }} ContentIds
@@ -159,7 +161,7 @@ export class IdRanges {
           j++
         }
       }
-      ids.length = ids[j - 1].len === 0 ? j - 1 : j
+      ids.length = ids.length === 0 ? 0 : (ids[j - 1].len === 0 ? j - 1 : j)
     }
     return ids
   }
@@ -887,20 +889,43 @@ export const writeIdSet = (encoder, idSet) => {
  */
 export const readIdSet = decoder => {
   const ds = new IdSet()
-  const numClients = decoding.readVarUint(decoder.restDecoder)
+  const restDecoder = decoder.restDecoder
+  const numClients = decoding.readVarUint(restDecoder)
+  if (numClients * 2 > restDecoder.arr.length - restDecoder.pos) {
+    throw error.create('Unexpected end of array')
+  }
   for (let i = 0; i < numClients; i++) {
     decoder.resetDsCurVal()
-    const client = decoding.readVarUint(decoder.restDecoder)
-    const numberOfDeletes = decoding.readVarUint(decoder.restDecoder)
+    const client = decoding.readVarUint(restDecoder)
+    const numberOfDeletes = decoding.readVarUint(restDecoder)
+    if (client > number.MAX_SAFE_INTEGER || ds.clients.has(client)) {
+      throw error.unexpectedCase()
+    }
+    if (numberOfDeletes * 2 > restDecoder.arr.length - restDecoder.pos) {
+      throw error.create('Unexpected end of array')
+    }
     if (numberOfDeletes > 0) {
       /**
        * @type {Array<IdRange>}
        */
       const dsRanges = []
-      for (let i = 0; i < numberOfDeletes; i++) {
-        dsRanges.push(new IdRange(decoder.readDsClock(), decoder.readDsLen()))
+      let isSorted = true
+      let prevEnd = -1
+      for (let j = 0; j < numberOfDeletes; j++) {
+        const clock = decoder.readDsClock()
+        const len = decoder.readDsLen()
+        if (clock < 0 || clock > number.MAX_SAFE_INTEGER || len <= 0 || len > number.MAX_SAFE_INTEGER - clock) {
+          throw error.unexpectedCase()
+        }
+        if (clock <= prevEnd) {
+          isSorted = false
+        }
+        prevEnd = clock + len
+        dsRanges.push(new IdRange(clock, len))
       }
-      ds.clients.set(client, new IdRanges(dsRanges))
+      const ranges = new IdRanges(dsRanges)
+      ranges.sorted = isSorted
+      ds.clients.set(client, ranges)
     }
   }
   return ds
@@ -927,7 +952,7 @@ export const decodeIdSet = data => readIdSet(new IdSetDecoderV2(decoding.createD
  */
 
 /**
- * @param {IdSetDecoderV1 | IdSetDecoderV2} decoder
+ * @param {IdSet} ds
  * @param {Transaction} transaction
  * @param {StructStore} store
  * @return {Uint8Array<ArrayBuffer>|null} Returns a v2 update containing all deletes that couldn't be applied yet; or null if all deletes were applied successfully.
@@ -935,18 +960,19 @@ export const decodeIdSet = data => readIdSet(new IdSetDecoderV2(decoding.createD
  * @private
  * @function
  */
-export const readAndApplyDeleteSet = (decoder, transaction, store) => {
+export const applyDeleteSet = (ds, transaction, store) => {
+  if (ds.clients.size === 0) {
+    return null
+  }
   const unappliedDS = new IdSet()
-  const numClients = decoding.readVarUint(decoder.restDecoder)
-  for (let i = 0; i < numClients; i++) {
-    decoder.resetDsCurVal()
-    const client = decoding.readVarUint(decoder.restDecoder)
-    const numberOfDeletes = decoding.readVarUint(decoder.restDecoder)
+  ds.clients.forEach((idRanges, client) => {
+    const ranges = idRanges.getIds()
     const structs = store.clients.get(client) || []
     const state = store.getClock(client)
-    for (let i = 0; i < numberOfDeletes; i++) {
-      const clock = decoder.readDsClock()
-      const clockEnd = clock + decoder.readDsLen()
+    for (let i = 0; i < ranges.length; i++) {
+      const range = ranges[i]
+      const clock = range.clock
+      const clockEnd = clock + range.len
       if (clock < state) {
         if (state < clockEnd) {
           unappliedDS.add(client, state, clockEnd - state)
@@ -963,7 +989,6 @@ export const readAndApplyDeleteSet = (decoder, transaction, store) => {
           structs.splice(++index, 0, /** @type {Item} */ (struct).split(transaction, clock - struct.id.clock))
         }
         while (index < structs.length) {
-          // @ts-ignore
           struct = structs[index++]
           if (struct.id.clock < clockEnd) {
             if (!struct.deleted) {
@@ -974,7 +999,7 @@ export const readAndApplyDeleteSet = (decoder, transaction, store) => {
                 struct.delete(transaction)
               } else { // is a Skip - add range to unappliedDS
                 const c = math.max(struct.id.clock, clock)
-                unappliedDS.add(client, c, math.min(struct.length, clockEnd - c))
+                unappliedDS.add(client, c, math.min(struct.id.clock + struct.length, clockEnd) - c)
               }
             }
           } else {
@@ -985,15 +1010,27 @@ export const readAndApplyDeleteSet = (decoder, transaction, store) => {
         unappliedDS.add(client, clock, clockEnd - clock)
       }
     }
-  }
+  })
   if (unappliedDS.clients.size > 0) {
-    const ds = new UpdateEncoderV2()
-    encoding.writeVarUint(ds.restEncoder, 0) // encode 0 structs
-    writeIdSet(ds, unappliedDS)
-    return ds.toUint8Array()
+    const dsEncoder = new UpdateEncoderV2()
+    encoding.writeVarUint(dsEncoder.restEncoder, 0) // encode 0 structs
+    writeIdSet(dsEncoder, unappliedDS)
+    return dsEncoder.toUint8Array()
   }
   return null
 }
+
+/**
+ * @param {IdSetDecoderV1 | IdSetDecoderV2} decoder
+ * @param {Transaction} transaction
+ * @param {StructStore} store
+ * @return {Uint8Array<ArrayBuffer>|null} Returns a v2 update containing all deletes that couldn't be applied yet; or null if all deletes were applied successfully.
+ *
+ * @private
+ * @function
+ */
+export const readAndApplyDeleteSet = (decoder, transaction, store) =>
+  applyDeleteSet(readIdSet(decoder), transaction, store)
 
 /**
  * @template Attrs
@@ -1578,7 +1615,11 @@ export const encodeIdMap = idmap => {
  */
 export const readIdMap = decoder => {
   const idmap = new IdMap()
-  const numClients = decoding.readVarUint(decoder.restDecoder)
+  const restDecoder = decoder.restDecoder
+  const numClients = decoding.readVarUint(restDecoder)
+  if (numClients * 2 > restDecoder.arr.length - restDecoder.pos) {
+    throw error.create('Unexpected end of array')
+  }
   /**
    * @type {Array<ContentAttribute<any>>}
    */
@@ -1590,36 +1631,57 @@ export const readIdMap = decoder => {
   let lastClientId = 0
   for (let i = 0; i < numClients; i++) {
     decoder.resetDsCurVal()
-    const client = lastClientId + decoding.readVarUint(decoder.restDecoder)
-    lastClientId = client
-    const numberOfDeletes = decoding.readVarUint(decoder.restDecoder)
-    /**
-     * @type {Array<AttrRange<any>>}
-     */
-    const attrRanges = []
-    for (let i = 0; i < numberOfDeletes; i++) {
-      const rangeClock = decoder.readDsClock()
-      const rangeLen = decoder.readDsLen()
-      /**
-       * @type {Array<ContentAttribute<any>>}
-       */
-      const attrs = []
-      const attrsLen = decoding.readVarUint(decoder.restDecoder)
-      for (let j = 0; j < attrsLen; j++) {
-        const attrId = decoding.readVarUint(decoder.restDecoder)
-        if (attrId >= visitedAttributions.length) {
-          // attrId not known yet
-          const attrNameId = decoding.readVarUint(decoder.restDecoder)
-          if (attrNameId >= visitedAttrNames.length) {
-            visitedAttrNames.push(decoding.readVarString(decoder.restDecoder))
-          }
-          visitedAttributions.push(new ContentAttribute(visitedAttrNames[attrNameId], decoding.readAny(decoder.restDecoder)))
-        }
-        attrs.push(visitedAttributions[attrId])
-      }
-      attrRanges.push(new AttrRange(rangeClock, rangeLen, attrs))
+    const clientDiff = decoding.readVarUint(restDecoder)
+    if (clientDiff > number.MAX_SAFE_INTEGER - lastClientId || (i > 0 && clientDiff === 0)) {
+      throw error.unexpectedCase()
     }
-    idmap.clients.set(client, new AttrRanges(attrRanges))
+    const client = lastClientId + clientDiff
+    lastClientId = client
+    const numberOfDeletes = decoding.readVarUint(restDecoder)
+    if (numberOfDeletes * 3 > restDecoder.arr.length - restDecoder.pos) {
+      throw error.create('Unexpected end of array')
+    }
+    if (numberOfDeletes > 0) {
+      /**
+       * @type {Array<AttrRange<any>>}
+       */
+      const attrRanges = []
+      for (let k = 0; k < numberOfDeletes; k++) {
+        const rangeClock = decoder.readDsClock()
+        const rangeLen = decoder.readDsLen()
+        if (rangeClock < 0 || rangeClock > number.MAX_SAFE_INTEGER || rangeLen <= 0 || rangeLen > number.MAX_SAFE_INTEGER - rangeClock) {
+          throw error.unexpectedCase()
+        }
+        /**
+         * @type {Array<ContentAttribute<any>>}
+         */
+        const attrs = []
+        const attrsLen = decoding.readVarUint(restDecoder)
+        if (attrsLen > restDecoder.arr.length - restDecoder.pos) {
+          throw error.create('Unexpected end of array')
+        }
+        for (let j = 0; j < attrsLen; j++) {
+          const attrId = decoding.readVarUint(restDecoder)
+          if (attrId > visitedAttributions.length) {
+            throw error.unexpectedCase()
+          }
+          if (attrId === visitedAttributions.length) {
+            // attrId not known yet
+            const attrNameId = decoding.readVarUint(restDecoder)
+            if (attrNameId > visitedAttrNames.length) {
+              throw error.unexpectedCase()
+            }
+            if (attrNameId === visitedAttrNames.length) {
+              visitedAttrNames.push(decoding.readVarString(restDecoder))
+            }
+            visitedAttributions.push(new ContentAttribute(visitedAttrNames[attrNameId], readSafeAny(restDecoder)))
+          }
+          attrs.push(visitedAttributions[attrId])
+        }
+        attrRanges.push(new AttrRange(rangeClock, rangeLen, attrs))
+      }
+      idmap.clients.set(client, new AttrRanges(attrRanges))
+    }
   }
   visitedAttributions.forEach(attr => {
     idmap.attrs.add(attr)

@@ -22,15 +22,32 @@ import { createID } from './ID.js'
 export const findIndexSS = (structs, clock) => {
   let left = 0
   let right = structs.length - 1
+  if (right < 0) {
+    throw error.unexpectedCase()
+  }
   let mid = structs[right]
   let midclock = mid.id.clock
-  if (midclock === clock) {
-    return right
+  const maxClock = midclock + mid.length - 1
+  if (clock >= midclock) {
+    if (clock <= maxClock) {
+      return right
+    }
+    throw error.unexpectedCase()
+  }
+  const firstClock = structs[0].id.clock
+  if (!(clock >= firstClock)) {
+    throw error.unexpectedCase()
   }
   // @todo does it even make sense to pivot the search?
   // If a good split misses, it might actually increase the time to find the correct item.
   // Currently, the only advantage is that search with pivoting might find the item on the first try.
-  let midindex = math.floor((clock / (midclock + mid.length - 1)) * right) // pivoting the search
+  const span = maxClock - firstClock
+  let midindex = span > 0 ? math.floor(((clock - firstClock) / span) * right) : 0 // pivoting the search
+  if (midindex < 0) {
+    midindex = 0
+  } else if (midindex > right) {
+    midindex = right
+  }
   while (left <= right) {
     mid = structs[midindex]
     midclock = mid.id.clock
