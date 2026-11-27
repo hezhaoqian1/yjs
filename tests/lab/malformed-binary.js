@@ -1072,139 +1072,141 @@ export const runMalformedBinarySuite = ({ seed, timeoutMs, verbose }) => {
   const testApplyEntryPoint = ({ category, payloadName, entryPoint, payload, mustReject = false }) => {
     totalChecks++
     const doc = createTargetDoc()
-    const beforeSV = Y.encodeStateVector(doc)
-    const beforeUpdate = Y.encodeStateAsUpdate(doc)
-    const beforeJson = doc.toJSON()
-
-    const heapBefore = process.memoryUsage().heapUsed
-    const t0 = performance.now()
-    let threw = false
-    /** @type {unknown} */
-    let thrownErr = null
-    try {
-      if (entryPoint === 'applyUpdate') {
-        Y.applyUpdate(doc, payload)
-      } else {
-        Y.applyUpdateV2(doc, payload)
-      }
-    } catch (err) {
-      threw = true
-      thrownErr = err
-      threwCount++
-    }
-    const elapsedMs = performance.now() - t0
-    const heapDeltaMB = (process.memoryUsage().heapUsed - heapBefore) / (1024 * 1024)
     let foundIssue = false
+    try {
+      const beforeSV = Y.encodeStateVector(doc)
+      const beforeUpdate = Y.encodeStateAsUpdate(doc)
+      const beforeJson = doc.toJSON()
 
-    if (elapsedMs > timeoutMs) {
-      foundIssue = true
-      recordFinding({
-        category,
-        payloadName,
-        entryPoint,
-        kind: 'DOS_SLOW',
-        elapsedMs,
-        heapDeltaMB,
-        payloadLen: payload.byteLength,
-        payloadHex: toHexPreview(payload),
-        detail: `Exceeded ${timeoutMs}ms budget (${elapsedMs.toFixed(1)}ms, threw=${threw})`
-      })
-    }
-
-    if (payload.byteLength <= 256 && heapDeltaMB > 32) {
-      foundIssue = true
-      recordFinding({
-        category,
-        payloadName,
-        entryPoint,
-        kind: 'DOS_ALLOC',
-        elapsedMs,
-        heapDeltaMB,
-        payloadLen: payload.byteLength,
-        payloadHex: toHexPreview(payload),
-        detail: `Tiny ${payload.byteLength}B payload allocated ${heapDeltaMB.toFixed(1)}MB heap`
-      })
-    }
-
-    if (threw) {
-      // Check post-throw invariants AND atomicity (doc must NOT be mutated if applyUpdate threw!)
+      const heapBefore = process.memoryUsage().heapUsed
+      const t0 = performance.now()
+      let threw = false
+      /** @type {unknown} */
+      let thrownErr = null
       try {
-        verifyDocInvariants(doc, { expectNoPending: false, label: `${entryPoint}:${payloadName}` })
-      } catch (invErr) {
+        if (entryPoint === 'applyUpdate') {
+          Y.applyUpdate(doc, payload)
+        } else {
+          Y.applyUpdateV2(doc, payload)
+        }
+      } catch (err) {
+        threw = true
+        thrownErr = err
+        threwCount++
+      }
+      const elapsedMs = performance.now() - t0
+      const heapDeltaMB = (process.memoryUsage().heapUsed - heapBefore) / (1024 * 1024)
+
+      if (elapsedMs > timeoutMs) {
         foundIssue = true
         recordFinding({
           category,
           payloadName,
           entryPoint,
-          kind: 'POST_THROW_INVARIANT_BROKEN',
+          kind: 'DOS_SLOW',
           elapsedMs,
           heapDeltaMB,
           payloadLen: payload.byteLength,
           payloadHex: toHexPreview(payload),
-          detail: `After throwing (${String(thrownErr)}), doc invariants broke: ${String(invErr)}`
+          detail: `Exceeded ${timeoutMs}ms budget (${elapsedMs.toFixed(1)}ms, threw=${threw})`
         })
       }
 
-      const afterSV = Y.encodeStateVector(doc)
-      const afterUpdate = Y.encodeStateAsUpdate(doc)
-      const afterJson = doc.toJSON()
-      const svSame = equalBytes(beforeSV, afterSV)
-      const updSame = equalBytes(beforeUpdate, afterUpdate)
-      const jsonCmp = deepEqualValues(beforeJson, afterJson)
-      const pendingClean = doc.store.pendingStructs === null && doc.store.pendingDs === null
-      if (!svSame || !updSame || !jsonCmp.equal || !pendingClean) {
+      if (payload.byteLength <= 256 && heapDeltaMB > 32) {
         foundIssue = true
         recordFinding({
           category,
           payloadName,
           entryPoint,
-          kind: 'ATOMICITY_VIOLATION',
+          kind: 'DOS_ALLOC',
           elapsedMs,
           heapDeltaMB,
           payloadLen: payload.byteLength,
           payloadHex: toHexPreview(payload),
-          detail: `Doc state mutated despite throwing (${String(thrownErr)}): svSame=${svSame} updSame=${updSame} jsonSame=${jsonCmp.equal} pendingClean=${pendingClean}`
+          detail: `Tiny ${payload.byteLength}B payload allocated ${heapDeltaMB.toFixed(1)}MB heap`
         })
       }
-    } else {
-      if (mustReject) {
-        foundIssue = true
-        recordFinding({
-          category,
-          payloadName,
-          entryPoint,
-          kind: 'UNREJECTED_INVALID_PAYLOAD',
-          elapsedMs,
-          heapDeltaMB,
-          payloadLen: payload.byteLength,
-          payloadHex: toHexPreview(payload),
-          detail: 'Strictly malformed payload was accepted without throwing'
-        })
+
+      if (threw) {
+        // Check post-throw invariants AND atomicity (doc must NOT be mutated if applyUpdate threw!)
+        try {
+          verifyDocInvariants(doc, { expectNoPending: false, label: `${entryPoint}:${payloadName}` })
+        } catch (invErr) {
+          foundIssue = true
+          recordFinding({
+            category,
+            payloadName,
+            entryPoint,
+            kind: 'POST_THROW_INVARIANT_BROKEN',
+            elapsedMs,
+            heapDeltaMB,
+            payloadLen: payload.byteLength,
+            payloadHex: toHexPreview(payload),
+            detail: `After throwing (${String(thrownErr)}), doc invariants broke: ${String(invErr)}`
+          })
+        }
+
+        const afterSV = Y.encodeStateVector(doc)
+        const afterUpdate = Y.encodeStateAsUpdate(doc)
+        const afterJson = doc.toJSON()
+        const svSame = equalBytes(beforeSV, afterSV)
+        const updSame = equalBytes(beforeUpdate, afterUpdate)
+        const jsonCmp = deepEqualValues(beforeJson, afterJson)
+        const pendingClean = doc.store.pendingStructs === null && doc.store.pendingDs === null
+        if (!svSame || !updSame || !jsonCmp.equal || !pendingClean) {
+          foundIssue = true
+          recordFinding({
+            category,
+            payloadName,
+            entryPoint,
+            kind: 'ATOMICITY_VIOLATION',
+            elapsedMs,
+            heapDeltaMB,
+            payloadLen: payload.byteLength,
+            payloadHex: toHexPreview(payload),
+            detail: `Doc state mutated despite throwing (${String(thrownErr)}): svSame=${svSame} updSame=${updSame} jsonSame=${jsonCmp.equal} pendingClean=${pendingClean}`
+          })
+        }
+      } else {
+        if (mustReject) {
+          foundIssue = true
+          recordFinding({
+            category,
+            payloadName,
+            entryPoint,
+            kind: 'UNREJECTED_INVALID_PAYLOAD',
+            elapsedMs,
+            heapDeltaMB,
+            payloadLen: payload.byteLength,
+            payloadHex: toHexPreview(payload),
+            detail: 'Strictly malformed payload was accepted without throwing'
+          })
+        }
+        // Even when accepted, doc MUST satisfy all internal invariants and be re-encodable!
+        try {
+          verifyDocInvariants(doc, { expectNoPending: false, label: `${entryPoint}:${payloadName}` })
+          Y.encodeStateAsUpdate(doc)
+          Y.encodeStateAsUpdateV2(doc)
+          doc.toJSON()
+          if (!foundIssue) acceptedSafeCount++
+        } catch (postErr) {
+          foundIssue = true
+          recordFinding({
+            category,
+            payloadName,
+            entryPoint,
+            kind: 'SILENT_CORRUPTION',
+            elapsedMs,
+            heapDeltaMB,
+            payloadLen: payload.byteLength,
+            payloadHex: toHexPreview(payload),
+            detail: `Accepted payload corrupted doc invariants or crashed post-apply access: ${String(postErr)}`
+          })
+        }
       }
-      // Even when accepted, doc MUST satisfy all internal invariants and be re-encodable!
-      try {
-        verifyDocInvariants(doc, { expectNoPending: false, label: `${entryPoint}:${payloadName}` })
-        Y.encodeStateAsUpdate(doc)
-        Y.encodeStateAsUpdateV2(doc)
-        doc.toJSON()
-        if (!foundIssue) acceptedSafeCount++
-      } catch (postErr) {
-        foundIssue = true
-        recordFinding({
-          category,
-          payloadName,
-          entryPoint,
-          kind: 'SILENT_CORRUPTION',
-          elapsedMs,
-          heapDeltaMB,
-          payloadLen: payload.byteLength,
-          payloadHex: toHexPreview(payload),
-          detail: `Accepted payload corrupted doc invariants or crashed post-apply access: ${String(postErr)}`
-        })
-      }
+    } finally {
+      doc.destroy()
     }
-
-    doc.destroy()
     bumpCategory(category, foundIssue)
   }
 

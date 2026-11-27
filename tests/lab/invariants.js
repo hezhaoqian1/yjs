@@ -52,6 +52,15 @@ const normalizeValue = val => {
       delta: val.toDeltaDeep().toJSON()
     }
   }
+  if (val instanceof Y.Doc) {
+    return {
+      __yDoc: true,
+      guid: val.guid,
+      gc: val.gc,
+      autoLoad: val.autoLoad,
+      meta: val.meta
+    }
+  }
   return val
 }
 
@@ -692,14 +701,17 @@ export const verifyConvergence = (
       const shouldCompareDirect = compareStores !== null ? compareStores : directComparable
       if (shouldCompareDirect) {
         compareStructStores(d0.store, di.store, label0, labeli)
-      } else if (d0.gc === di.gc && !d0.gc) {
+      } else if (compareStores !== false && d0.gc === di.gc && !d0.gc) {
         // Same gc=false but local UndoManager `redone` blocked local Item.mergeWith:
         // verify wire-canonical StructStore equivalence after roundtripping both docs
         const refDoc = canonicalD0 ?? d0
         const freshI = new Y.Doc({ gc: di.gc })
-        Y.applyUpdate(freshI, Y.encodeStateAsUpdate(di))
-        compareStructStores(refDoc.store, freshI.store, `${label0}[canonical]`, `${labeli}[canonical]`)
-        freshI.destroy()
+        try {
+          Y.applyUpdate(freshI, Y.encodeStateAsUpdate(di))
+          compareStructStores(refDoc.store, freshI.store, `${label0}[canonical]`, `${labeli}[canonical]`)
+        } finally {
+          freshI.destroy()
+        }
       }
 
       for (let k = 0; k < rootKeys.length; k++) {
@@ -723,23 +735,28 @@ export const verifyConvergence = (
         { label: 'roundtrip-v2-to-v1', doc: new Y.Doc({ gc: d0.gc }), apply: /** @param {Doc} d */ d => Y.applyUpdate(d, u2ToV1) }
       ]
 
-      for (let i = 0; i < rtDocs.length; i++) {
-        const rt = rtDocs[i]
-        rt.apply(rt.doc)
-        verifyDocInvariants(rt.doc, { expectNoPending: true, label: rt.label })
-        assertInvariant(
-          equalBytes(sv0, Y.encodeStateVector(rt.doc)),
-          `${rt.label}: StateVector mismatch against doc[0]`
-        )
-        assertInvariant(
-          Y.equalContentIds(cidsFull0, Y.createContentIdsFromDoc(rt.doc, true)),
-          `${rt.label}: ContentIds(full) mismatch against doc[0]`
-        )
-        compareStructStores(refForStore.store, rt.doc.store, 'doc[0][canonical]', rt.label)
-        for (let k = 0; k < rootKeys.length; k++) {
-          verifyRootKeyEquality(d0, rt.doc, rootKeys[k], 'doc[0]', rt.label)
+      try {
+        for (let i = 0; i < rtDocs.length; i++) {
+          const rt = rtDocs[i]
+          rt.apply(rt.doc)
+          verifyDocInvariants(rt.doc, { expectNoPending: true, label: rt.label })
+          assertInvariant(
+            equalBytes(sv0, Y.encodeStateVector(rt.doc)),
+            `${rt.label}: StateVector mismatch against doc[0]`
+          )
+          assertInvariant(
+            Y.equalContentIds(cidsFull0, Y.createContentIdsFromDoc(rt.doc, true)),
+            `${rt.label}: ContentIds(full) mismatch against doc[0]`
+          )
+          compareStructStores(refForStore.store, rt.doc.store, 'doc[0][canonical]', rt.label)
+          for (let k = 0; k < rootKeys.length; k++) {
+            verifyRootKeyEquality(d0, rt.doc, rootKeys[k], 'doc[0]', rt.label)
+          }
         }
-        rt.doc.destroy()
+      } finally {
+        for (let i = 0; i < rtDocs.length; i++) {
+          rtDocs[i].doc.destroy()
+        }
       }
     }
   } finally {

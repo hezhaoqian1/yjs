@@ -611,8 +611,8 @@ export const runScenario = ({ seed, scenario, ops, clientCountOverride = null })
     }
 
     doc.on('update', (update, origin) => {
-      globalUpdatesV1.push(update)
       if (origin === NETWORK_ORIGIN) return
+      globalUpdatesV1.push(update)
       if (!simClient.online) return
       // Decide whether to broadcast V1, V2, or converted format
       const useV2 = scenario.formatMode === 'v2-heavy'
@@ -637,8 +637,8 @@ export const runScenario = ({ seed, scenario, ops, clientCountOverride = null })
     })
 
     doc.on('updateV2', (updateV2, origin) => {
-      globalUpdatesV2.push(updateV2)
       if (origin === NETWORK_ORIGIN) return
+      globalUpdatesV2.push(updateV2)
       if (!simClient.online) return
       const sendViaV2 = scenario.formatMode === 'v2-heavy'
         ? prng.real53(gen) < 0.85
@@ -706,10 +706,12 @@ export const runScenario = ({ seed, scenario, ops, clientCountOverride = null })
         if (targetFmt === 'v1') {
           const merged = Y.mergeUpdates(batch)
           Y.applyUpdate(receiver.doc, merged, NETWORK_ORIGIN)
+          if (receiver.deliveredV1.length >= 128) receiver.deliveredV1.shift()
           receiver.deliveredV1.push(merged)
         } else {
           const merged = Y.mergeUpdatesV2(batch)
           Y.applyUpdateV2(receiver.doc, merged, NETWORK_ORIGIN)
+          if (receiver.deliveredV2.length >= 128) receiver.deliveredV2.shift()
           receiver.deliveredV2.push(merged)
         }
         stats.batchMerges++
@@ -736,9 +738,11 @@ export const runScenario = ({ seed, scenario, ops, clientCountOverride = null })
     }
     if (env.format === 'v1') {
       Y.applyUpdate(receiver.doc, env.update, NETWORK_ORIGIN)
+      if (receiver.deliveredV1.length >= 128) receiver.deliveredV1.shift()
       receiver.deliveredV1.push(env.update)
     } else {
       Y.applyUpdateV2(receiver.doc, env.update, NETWORK_ORIGIN)
+      if (receiver.deliveredV2.length >= 128) receiver.deliveredV2.shift()
       receiver.deliveredV2.push(env.update)
     }
     stats.messagesDelivered++
@@ -771,192 +775,200 @@ export const runScenario = ({ seed, scenario, ops, clientCountOverride = null })
     stats.diffSyncs++
   }
 
-  // Main deterministic fuzzing loop
-  for (let step = 0; step < ops; step++) {
-    const client = clients[prng.uint32(gen, 0, numClients - 1)]
+  /** @type {Y.Doc | null} */
+  let mergedV1Doc = null
+  /** @type {Y.Doc | null} */
+  let mergedV2Doc = null
+  /** @type {Y.Doc | null} */
+  let clonedDoc = null
 
-    // 1. Perform a local CRDT mutation or UndoManager undo/redo
-    if (client.undoManager !== null && client.undoManager.redoStack.length > 0 && prng.uint32(gen, 0, 1) === 0) {
-      client.undoManager.redo()
-      stats.redos++
-    } else if (client.undoManager !== null && prng.uint32(gen, 0, 5) === 0) {
-      if (client.undoManager.undoStack.length > 0) {
-        client.undoManager.undo()
-        stats.undos++
+  try {
+    // Main deterministic fuzzing loop
+    for (let step = 0; step < ops; step++) {
+      const client = clients[prng.uint32(gen, 0, numClients - 1)]
+
+      // 1. Perform a local CRDT mutation or UndoManager undo/redo
+      if (client.undoManager !== null && client.undoManager.redoStack.length > 0 && prng.uint32(gen, 0, 1) === 0) {
+        client.undoManager.redo()
+        stats.redos++
+      } else if (client.undoManager !== null && prng.uint32(gen, 0, 5) === 0) {
+        if (client.undoManager.undoStack.length > 0) {
+          client.undoManager.undo()
+          stats.undos++
+        } else {
+          mutateText(client.doc, gen)
+        }
       } else {
-        mutateText(client.doc, gen)
+        const targetType = prng.uint32(gen, 0, 3)
+        if (targetType === 0) {
+          mutateText(client.doc, gen)
+        } else if (targetType === 1) {
+          mutateArray(client.doc, gen, scenario.nestedBias)
+        } else if (targetType === 2) {
+          mutateMap(client.doc, gen, scenario.nestedBias)
+        } else {
+          mutateXml(client.doc, gen)
+        }
+        if (client.undoManager !== null && prng.uint32(gen, 0, 2) === 0) {
+          client.undoManager.stopCapturing()
+        }
       }
-    } else {
-      const targetType = prng.uint32(gen, 0, 3)
-      if (targetType === 0) {
-        mutateText(client.doc, gen)
-      } else if (targetType === 1) {
-        mutateArray(client.doc, gen, scenario.nestedBias)
-      } else if (targetType === 2) {
-        mutateMap(client.doc, gen, scenario.nestedBias)
-      } else {
-        mutateXml(client.doc, gen)
+      stats.opsExecuted++
+
+      // 2. Network partition / reconnect events
+      if (prng.real53(gen) < scenario.partitionProb) {
+        const pAction = prng.uint32(gen, 0, 3)
+        if (pAction === 0) {
+          // Split into 2 or 3 partition groups
+          const groups = prng.uint32(gen, 2, 3)
+          for (let i = 0; i < numClients; i++) {
+            clients[i].partitionGroup = prng.uint32(gen, 0, groups - 1)
+          }
+          stats.partitions++
+        } else if (pAction === 1) {
+          // Toggle a random client online/offline
+          const victim = clients[prng.uint32(gen, 0, numClients - 1)]
+          victim.online = !victim.online
+          if (!victim.online) {
+            // Drop half of buffered inbox to simulate dropped packets during disconnect
+            victim.inbox.length = math.floor(victim.inbox.length / 2)
+          }
+          stats.partitions++
+        } else if (pAction === 2) {
+          // Heal partitions and reconnect everyone
+          for (let i = 0; i < numClients; i++) {
+            clients[i].online = true
+            clients[i].partitionGroup = 0
+          }
+          stats.partitions++
+        } else {
+          // Re-deliver an already delivered historical update to test idempotence
+          const target = clients[prng.uint32(gen, 0, numClients - 1)]
+          if (target.deliveredV1.length > 0 && prng.bool(gen)) {
+            const oldU = prng.oneOf(gen, target.deliveredV1)
+            Y.applyUpdate(target.doc, oldU, NETWORK_ORIGIN)
+            stats.duplicatesDelivered++
+          } else if (target.deliveredV2.length > 0) {
+            const oldU2 = prng.oneOf(gen, target.deliveredV2)
+            Y.applyUpdateV2(target.doc, oldU2, NETWORK_ORIGIN)
+            stats.duplicatesDelivered++
+          }
+        }
       }
-      if (client.undoManager !== null && prng.uint32(gen, 0, 2) === 0) {
-        client.undoManager.stopCapturing()
+
+      // 3. Deliver a few random out-of-order messages (skip some steps in extreme-out-of-order mode to let queues build)
+      const deliverAttempts = scenario.outOfOrderBias > 0.9 ? (step % 3 === 0 ? 3 : 0) : prng.uint32(gen, 1, 3)
+      for (let d = 0; d < deliverAttempts; d++) {
+        const withInbox = clients.filter(c => c.online && c.inbox.length > 0)
+        if (withInbox.length === 0) break
+        const receiver = prng.oneOf(gen, withInbox)
+        deliverToClient(receiver, true)
+      }
+
+      // 4. Occasional pairwise diff sync within the same partition
+      if (step % 11 === 0) {
+        const a = clients[prng.uint32(gen, 0, numClients - 1)]
+        const b = clients[prng.uint32(gen, 0, numClients - 1)]
+        if (a !== b && a.online && b.online && a.partitionGroup === b.partitionGroup) {
+          syncPairViaDiff(a, b)
+        }
+      }
+
+      // 5. Mid-run deep invariant check (even with active skips / pendingStructs / pendingDs!)
+      if (step > 0 && step % 50 === 0) {
+        for (let i = 0; i < numClients; i++) {
+          const d = clients[i].doc
+          const skipClients = d.store.skips.clients.size
+          if (skipClients > stats.maxObservedSkips) stats.maxObservedSkips = skipClients
+          const pendingCount = (d.store.pendingStructs ? 1 : 0) + (d.store.pendingDs ? 1 : 0)
+          if (pendingCount > stats.maxObservedPending) stats.maxObservedPending = pendingCount
+          verifyDocInvariants(d, {
+            expectNoPending: false,
+            label: `run(${scenario.name},seed=${seed},step=${step},client=${i})`
+          })
+          stats.invariantChecks++
+        }
+        if (scenario.checkSnapshots) {
+          const sample = clients[prng.uint32(gen, 0, numClients - 1)].doc
+          verifySnapshotAndContentIds(sample)
+          stats.snapshotChecks++
+        }
       }
     }
-    stats.opsExecuted++
 
-    // 2. Network partition / reconnect events
-    if (prng.real53(gen) < scenario.partitionProb) {
-      const pAction = prng.uint32(gen, 0, 3)
-      if (pAction === 0) {
-        // Split into 2 or 3 partition groups
-        const groups = prng.uint32(gen, 2, 3)
-        for (let i = 0; i < numClients; i++) {
-          clients[i].partitionGroup = prng.uint32(gen, 0, groups - 1)
-        }
-        stats.partitions++
-      } else if (pAction === 1) {
-        // Toggle a random client online/offline
-        const victim = clients[prng.uint32(gen, 0, numClients - 1)]
-        victim.online = !victim.online
-        if (!victim.online) {
-          // Drop half of buffered inbox to simulate dropped packets during disconnect
-          victim.inbox.length = math.floor(victim.inbox.length / 2)
-        }
-        stats.partitions++
-      } else if (pAction === 2) {
-        // Heal partitions and reconnect everyone
-        for (let i = 0; i < numClients; i++) {
-          clients[i].online = true
-          clients[i].partitionGroup = 0
-        }
-        stats.partitions++
-      } else {
-        // Re-deliver an already delivered historical update to test idempotence
-        const target = clients[prng.uint32(gen, 0, numClients - 1)]
-        if (target.deliveredV1.length > 0 && prng.bool(gen)) {
-          const oldU = prng.oneOf(gen, target.deliveredV1)
-          Y.applyUpdate(target.doc, oldU, NETWORK_ORIGIN)
-          stats.duplicatesDelivered++
-        } else if (target.deliveredV2.length > 0) {
-          const oldU2 = prng.oneOf(gen, target.deliveredV2)
-          Y.applyUpdateV2(target.doc, oldU2, NETWORK_ORIGIN)
-          stats.duplicatesDelivered++
-        }
-      }
+    // Final heal phase: reconnect all clients, drain inboxes in random order, then full state-vector sync
+    for (let i = 0; i < numClients; i++) {
+      clients[i].online = true
+      clients[i].partitionGroup = 0
     }
-
-    // 3. Deliver a few random out-of-order messages (skip some steps in extreme-out-of-order mode to let queues build)
-    const deliverAttempts = scenario.outOfOrderBias > 0.9 ? (step % 3 === 0 ? 3 : 0) : prng.uint32(gen, 1, 3)
-    for (let d = 0; d < deliverAttempts; d++) {
-      const withInbox = clients.filter(c => c.online && c.inbox.length > 0)
+    while (true) {
+      const withInbox = clients.filter(c => c.inbox.length > 0)
       if (withInbox.length === 0) break
       const receiver = prng.oneOf(gen, withInbox)
-      deliverToClient(receiver, true)
+      deliverToClient(receiver, false)
     }
 
-    // 4. Occasional pairwise diff sync within the same partition
-    if (step % 11 === 0) {
-      const a = clients[prng.uint32(gen, 0, numClients - 1)]
-      const b = clients[prng.uint32(gen, 0, numClients - 1)]
-      if (a !== b && a.online && b.online && a.partitionGroup === b.partitionGroup) {
-        syncPairViaDiff(a, b)
-      }
-    }
-
-    // 5. Mid-run deep invariant check (even with active skips / pendingStructs / pendingDs!)
-    if (step > 0 && step % 50 === 0) {
+    // Ring + hub-and-spoke state-vector diff sync so every client receives every missing op/delete
+    // even across earlier disconnects and dropped packets
+    for (let round = 0; round < 2; round++) {
       for (let i = 0; i < numClients; i++) {
-        const d = clients[i].doc
-        const skipClients = d.store.skips.clients.size
-        if (skipClients > stats.maxObservedSkips) stats.maxObservedSkips = skipClients
-        const pendingCount = (d.store.pendingStructs ? 1 : 0) + (d.store.pendingDs ? 1 : 0)
-        if (pendingCount > stats.maxObservedPending) stats.maxObservedPending = pendingCount
-        verifyDocInvariants(d, {
-          expectNoPending: false,
-          label: `run(${scenario.name},seed=${seed},step=${step},client=${i})`
-        })
-        stats.invariantChecks++
+        const next = clients[(i + 1) % numClients]
+        syncPairViaDiff(clients[i], next)
       }
-      if (scenario.checkSnapshots) {
-        const sample = clients[prng.uint32(gen, 0, numClients - 1)].doc
-        verifySnapshotAndContentIds(sample)
-        stats.snapshotChecks++
+      for (let i = 1; i < numClients; i++) {
+        syncPairViaDiff(clients[0], clients[i])
+        syncPairViaDiff(clients[i], clients[0])
       }
     }
-  }
 
-  // Final heal phase: reconnect all clients, drain inboxes in random order, then full state-vector sync
-  for (let i = 0; i < numClients; i++) {
-    clients[i].online = true
-    clients[i].partitionGroup = 0
-  }
-  while (true) {
-    const withInbox = clients.filter(c => c.inbox.length > 0)
-    if (withInbox.length === 0) break
-    const receiver = prng.oneOf(gen, withInbox)
-    deliverToClient(receiver, false)
-  }
-
-  // Ring + hub-and-spoke state-vector diff sync so every client receives every missing op/delete
-  // even across earlier disconnects and dropped packets
-  for (let round = 0; round < 2; round++) {
-    for (let i = 0; i < numClients; i++) {
-      const next = clients[(i + 1) % numClients]
-      syncPairViaDiff(clients[i], next)
+    // Construct synthetic verification docs via mergeUpdates / mergeUpdatesV2 / format conversions / cloneDoc
+    const baseGc = clients[0].doc.gc
+    const shuffledV1 = shuffleCopy(gen, globalUpdatesV1)
+    if (shuffledV1.length > 2) {
+      // Inject duplicates to stress mergeUpdates deduplication
+      shuffledV1.push(shuffledV1[0], shuffledV1[math.floor(shuffledV1.length / 2)])
     }
-    for (let i = 1; i < numClients; i++) {
-      syncPairViaDiff(clients[0], clients[i])
-      syncPairViaDiff(clients[i], clients[0])
+    mergedV1Doc = new Y.Doc({ gc: baseGc })
+    Y.applyUpdate(mergedV1Doc, Y.mergeUpdates(shuffledV1))
+
+    const shuffledV2 = shuffleCopy(gen, globalUpdatesV2)
+    if (shuffledV2.length > 2) {
+      shuffledV2.push(shuffledV2[0], shuffledV2[math.floor(shuffledV2.length / 2)])
     }
+    mergedV2Doc = new Y.Doc({ gc: baseGc })
+    Y.applyUpdateV2(mergedV2Doc, Y.mergeUpdatesV2(shuffledV2))
+
+    clonedDoc = Y.cloneDoc(clients[0].doc, { gc: baseGc })
+
+    // Verify final snapshot & ContentIds consistency on converged docs
+    verifySnapshotAndContentIds(clients[0].doc)
+    stats.snapshotChecks++
+
+    const allDocs = [
+      ...clients.map(c => c.doc),
+      mergedV1Doc,
+      mergedV2Doc,
+      clonedDoc
+    ]
+
+    // Homogeneous GC with no UndoManager must satisfy direct StructStore equality;
+    // homogeneous gc:false with UndoManager verifies canonical wire StructStore equality
+    const strictDirectStoreMatch = (scenario.gcMode === 'all-off' || scenario.gcMode === 'all-on') && scenario.undoClients === 0
+    verifyConvergence(allDocs, ROOT_KEYS, {
+      compareStores: strictDirectStoreMatch ? true : null,
+      checkRoundtrip: true
+    })
+
+    return stats
+  } finally {
+    for (let i = 0; i < clients.length; i++) {
+      clients[i].undoManager?.destroy()
+      clients[i].doc.destroy()
+    }
+    mergedV1Doc?.destroy()
+    mergedV2Doc?.destroy()
+    clonedDoc?.destroy()
   }
-
-  // Construct synthetic verification docs via mergeUpdates / mergeUpdatesV2 / format conversions / cloneDoc
-  const baseGc = clients[0].doc.gc
-  const shuffledV1 = shuffleCopy(gen, globalUpdatesV1)
-  if (shuffledV1.length > 2) {
-    // Inject duplicates to stress mergeUpdates deduplication
-    shuffledV1.push(shuffledV1[0], shuffledV1[math.floor(shuffledV1.length / 2)])
-  }
-  const mergedV1Doc = new Y.Doc({ gc: baseGc })
-  Y.applyUpdate(mergedV1Doc, Y.mergeUpdates(shuffledV1))
-
-  const shuffledV2 = shuffleCopy(gen, globalUpdatesV2)
-  if (shuffledV2.length > 2) {
-    shuffledV2.push(shuffledV2[0], shuffledV2[math.floor(shuffledV2.length / 2)])
-  }
-  const mergedV2Doc = new Y.Doc({ gc: baseGc })
-  Y.applyUpdateV2(mergedV2Doc, Y.mergeUpdatesV2(shuffledV2))
-
-  const clonedDoc = Y.cloneDoc(clients[0].doc, { gc: baseGc })
-
-  // Verify final snapshot & ContentIds consistency on converged docs
-  verifySnapshotAndContentIds(clients[0].doc)
-  stats.snapshotChecks++
-
-  const allDocs = [
-    ...clients.map(c => c.doc),
-    mergedV1Doc,
-    mergedV2Doc,
-    clonedDoc
-  ]
-
-  // Homogeneous GC with no UndoManager must satisfy direct StructStore equality;
-  // homogeneous gc:false with UndoManager verifies canonical wire StructStore equality
-  const strictDirectStoreMatch = (scenario.gcMode === 'all-off' || scenario.gcMode === 'all-on') && scenario.undoClients === 0
-  verifyConvergence(allDocs, ROOT_KEYS, {
-    compareStores: strictDirectStoreMatch ? true : null,
-    checkRoundtrip: true
-  })
-
-  // Clean up
-  for (let i = 0; i < clients.length; i++) {
-    clients[i].undoManager?.destroy()
-    clients[i].doc.destroy()
-  }
-  mergedV1Doc.destroy()
-  mergedV2Doc.destroy()
-  clonedDoc.destroy()
-
-  return stats
 }
 
 /**
@@ -968,8 +980,12 @@ const parseArgs = argv => {
   let seed = 20261127
   /** @type {number | null} */
   let clients = null
-  let ops = 120
-  let runs = SCENARIOS.length
+  /** @type {number | null} */
+  let opsOverride = null
+  /** @type {number | null} */
+  let runsOverride = null
+  /** @type {'default' | 'high' | 'extreme'} */
+  let intensity = 'default'
   /** @type {string | null} */
   let scenarioName = null
   let verbose = false
@@ -981,18 +997,25 @@ const parseArgs = argv => {
     } else if (arg === '--clients' && i + 1 < argv.length) {
       clients = Number.parseInt(argv[++i], 10)
     } else if (arg === '--ops' && i + 1 < argv.length) {
-      ops = Number.parseInt(argv[++i], 10)
+      opsOverride = Number.parseInt(argv[++i], 10)
     } else if (arg === '--runs' && i + 1 < argv.length) {
-      runs = Number.parseInt(argv[++i], 10)
+      runsOverride = Number.parseInt(argv[++i], 10)
+    } else if (arg === '--intensity' && i + 1 < argv.length) {
+      const val = argv[++i]
+      if (val === 'default' || val === 'high' || val === 'extreme') {
+        intensity = val
+      }
     } else if (arg === '--scenario' && i + 1 < argv.length) {
       scenarioName = argv[++i]
     } else if (arg === '--verbose') {
       verbose = true
     } else if (arg === '--help' || arg === '-h') {
-      console.log('Usage: node ./tests/lab/convergence-fuzzer.js [--seed N] [--clients N] [--ops N] [--runs N] [--scenario NAME] [--verbose]')
+      console.log('Usage: node ./tests/lab/convergence-fuzzer.js [--seed N] [--clients N] [--ops N] [--runs N] [--intensity default|high|extreme] [--scenario NAME] [--verbose]')
       process.exit(0)
     }
   }
+  const ops = opsOverride ?? (intensity === 'extreme' ? 250 : intensity === 'high' ? 200 : 120)
+  const runs = runsOverride ?? (intensity === 'extreme' ? 40 : intensity === 'high' ? 16 : SCENARIOS.length)
   return { seed, clients, ops, runs, scenarioName, verbose }
 }
 
