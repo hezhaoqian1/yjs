@@ -32,7 +32,7 @@ import { AttributedContent, rendererContentLength, rendererMode } from './utils/
 import { removeEventHandlerListener, callEventHandlerListeners, addEventHandlerListener, createEventHandler } from './utils/EventHandler.js'
 import { createID } from './utils/ID.js'
 import { createIdSet, iterateStructsByIdSetWithoutSplits } from './utils/ids.js'
-import { getItemCleanStart, cleanupFormattingGap } from './utils/transaction-helpers.js'
+import { getItemCleanStart, cleanupFormattingGap, equalFormats } from './utils/transaction-helpers.js'
 import { transact } from './utils/Transaction.js'
 import { YEvent } from './utils/YEvent.js'
 import { $doc } from './utils/schemas.js'
@@ -2253,12 +2253,7 @@ export const typeApplyRendererChange = (type, changes, origin) => {
   }
 }
 
-/**
- * @param {any} a
- * @param {any} b
- * @return {boolean}
- */
-export const equalFormats = (a, b) => a === b || (typeof a === 'object' && typeof b === 'object' && a && b && object.equalFlat(a, b))
+export { equalFormats }
 
 /**
  * @template {delta.DeltaConf} DConf

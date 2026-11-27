@@ -1,5 +1,6 @@
 import * as math from 'lib0/math'
 import * as error from 'lib0/error'
+import * as fun from 'lib0/function'
 import * as map from 'lib0/map'
 import * as set from 'lib0/set'
 
@@ -375,6 +376,11 @@ export const updateCurrentFormats = (currentFormats, { key, value }) => {
 }
 
 /**
+ * Compare two format values (primitives or nested objects/arrays such as ProseMirror/Tiptap marks).
+ */
+export const equalFormats = fun.equalityDeep
+
+/**
  * Call this function after string content has been deleted in order to
  * clean up formatting Items.
  *
@@ -415,12 +421,12 @@ export const cleanupFormattingGap = (transaction, start, curr, startFormats, cur
       if (content.getRef() === 6) { // is ContentFormat
         const { key, value } = /** @type {ContentFormat} */ (content)
         const startFormatValue = startFormats.get(key) ?? null
-        if (endFormats.get(key) !== content || startFormatValue === value) {
+        if (endFormats.get(key) !== content || equalFormats(startFormatValue, value)) {
           // Either this format is overwritten or it is not necessary because the format already existed.
           start.delete(transaction)
           transaction.cleanUps.add(start.id.client, start.id.clock, start.length)
           cleanups++
-          if (!reachedCurr && (currFormats.get(key) ?? null) === value && startFormatValue !== value) {
+          if (!reachedCurr && equalFormats(currFormats.get(key) ?? null, value) && !equalFormats(startFormatValue, value)) {
             if (startFormatValue === null) {
               currFormats.delete(key)
             } else {
