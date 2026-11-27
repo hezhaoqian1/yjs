@@ -1631,6 +1631,7 @@ export class ContentType {
     }
     while (stack.length > 0) {
       const type = /** @type {import('../ynode.js').YNode} */ (stack.pop())
+      clearParentSearchMarkers(type)
       let item = type._start
       while (item !== null) {
         visitChild(item)
@@ -1670,6 +1671,7 @@ export class ContentType {
         item = item.right
       }
       type._start = null
+      clearParentSearchMarkers(type)
       type._map.forEach(/** @param {Item | null} mItem */ mItem => {
         while (mItem !== null) {
           gcChild(mItem)

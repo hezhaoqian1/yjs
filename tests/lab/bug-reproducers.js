@@ -2196,6 +2196,121 @@ export const REPRODUCERS = [
         doc1.destroy()
       }
     }
+  },
+  {
+    id: 'BUG-CONTENTTYPE-SEARCHMARKER-GC',
+    title: 'ContentType.delete and ContentType.gc leave stale/dangling _searchMarker entries and leaked item.marker bits on deleted YNode subtrees',
+    targetPr: 'PR #5',
+    run: () => {
+      const doc1 = new Y.Doc({ gc: false })
+      doc1.clientID = 1
+      const doc2 = new Y.Doc({ gc: true })
+      doc2.clientID = 2
+      try {
+        // Part A (gc: false): ContentType.delete must clear section._searchMarker & item.marker bits
+        const root1 = doc1.get('root')
+        const section1 = new Y.Node('section')
+        root1.insert(0, [section1])
+        section1.insert(0, [new Y.Node('p'), new Y.Node('p')])
+        const picked1 = section1.get(1)
+        assertInvariant(picked1 instanceof Y.Node, 'BUG-CONTENTTYPE-SEARCHMARKER-GC(A): setup expected Y.Node at index 1')
+        assertInvariant(
+          section1._searchMarker !== null && section1._searchMarker.length > 0,
+          'BUG-CONTENTTYPE-SEARCHMARKER-GC(A): setup failed to populate section1._searchMarker'
+        )
+
+        root1.delete(0, 1)
+        assertInvariant(
+          section1._searchMarker === null || section1._searchMarker.length === 0,
+          `BUG-CONTENTTYPE-SEARCHMARKER-GC(A): ContentType.delete left ${section1._searchMarker ? section1._searchMarker.length : 0} stale _searchMarker(s) on deleted YNode`
+        )
+        for (let it = section1._start; it !== null; it = it.right) {
+          assertInvariant(
+            !it.marker,
+            `BUG-CONTENTTYPE-SEARCHMARKER-GC(A): ContentType.delete left leaked item.marker===true on (${it.id.client},${it.id.clock})`
+          )
+        }
+        verifyDocInvariants(doc1, { expectNoPending: true, label: 'BUG-CONTENTTYPE-SEARCHMARKER-GC:A' })
+
+        // Part A2 (gc: false, pre-deleted child): ContentType.delete must clear _searchMarker even when all children were already deleted
+        const section1b = new Y.Node('section')
+        root1.insert(0, [section1b])
+        section1b.insert(0, 'hello')
+        section1b.delete(0, 5)
+        section1b.get(1) // marks the already-deleted item inside section1b._searchMarker
+        assertInvariant(
+          section1b._searchMarker !== null && section1b._searchMarker.length > 0,
+          'BUG-CONTENTTYPE-SEARCHMARKER-GC(A2): setup failed to populate section1b._searchMarker on deleted child'
+        )
+        root1.delete(0, 1)
+        assertInvariant(
+          (section1b._searchMarker?.length ?? 0) === 0,
+          `BUG-CONTENTTYPE-SEARCHMARKER-GC(A2): ContentType.delete left ${section1b._searchMarker ? section1b._searchMarker.length : 0} stale _searchMarker(s) when children were pre-deleted`
+        )
+        assertInvariant(
+          section1b._start !== null && !section1b._start.marker,
+          'BUG-CONTENTTYPE-SEARCHMARKER-GC(A2): ContentType.delete left leaked item.marker===true on pre-deleted child'
+        )
+        verifyDocInvariants(doc1, { expectNoPending: true, label: 'BUG-CONTENTTYPE-SEARCHMARKER-GC:A2' })
+
+        // Part B (gc: true): ContentType.gc must clear _searchMarker so detached/GCd items are never pinned or returned by .get()
+        const root2 = doc2.get('root')
+        const section2 = new Y.Node('section')
+        const section3 = new Y.Node('section')
+        root2.insert(0, [section2, section3])
+        section2.insert(0, [new Y.Node('p'), new Y.Node('p')])
+        section3.insert(0, 'hello')
+        doc2.clientID = 3
+        section3.insert(5, 'world')
+        doc2.clientID = 2
+
+        const picked2 = section2.get(1)
+        assertInvariant(picked2 instanceof Y.Node, 'BUG-CONTENTTYPE-SEARCHMARKER-GC(B): setup expected Y.Node at index 1')
+        assertInvariant(
+          section2._searchMarker !== null && section2._searchMarker.length > 0,
+          'BUG-CONTENTTYPE-SEARCHMARKER-GC(B): setup failed to populate section2._searchMarker'
+        )
+        section3.get(5)
+        assertInvariant(
+          section3._searchMarker !== null && section3._searchMarker.length > 0,
+          'BUG-CONTENTTYPE-SEARCHMARKER-GC(B): setup failed to populate section3._searchMarker'
+        )
+        /** @type {Array<Y.Item>} */
+        const trackedItems = []
+        for (let it = section2._start; it !== null; it = it.right) trackedItems.push(it)
+        for (let it = section3._start; it !== null; it = it.right) trackedItems.push(it)
+
+        root2.delete(0, 2)
+        assertInvariant(section2._start === null, 'BUG-CONTENTTYPE-SEARCHMARKER-GC(B): expected section2._start === null after GC')
+        assertInvariant(section3._start === null, 'BUG-CONTENTTYPE-SEARCHMARKER-GC(B): expected section3._start === null after GC')
+        assertInvariant(
+          section2._searchMarker === null || section2._searchMarker.length === 0,
+          `BUG-CONTENTTYPE-SEARCHMARKER-GC(B): ContentType.gc left ${section2._searchMarker ? section2._searchMarker.length : 0} dangling _searchMarker(s) on GCd section2`
+        )
+        assertInvariant(
+          section3._searchMarker === null || section3._searchMarker.length === 0,
+          `BUG-CONTENTTYPE-SEARCHMARKER-GC(B): ContentType.gc left ${section3._searchMarker ? section3._searchMarker.length : 0} dangling _searchMarker(s) on GCd section3`
+        )
+        for (let i = 0; i < trackedItems.length; i++) {
+          assertInvariant(
+            !trackedItems[i].marker,
+            `BUG-CONTENTTYPE-SEARCHMARKER-GC(B): ContentType.gc left leaked item.marker===true on detached item (${trackedItems[i].id.client},${trackedItems[i].id.clock})`
+          )
+        }
+        assertInvariant(
+          section2.get(0) === undefined && section2.get(1) === undefined,
+          'BUG-CONTENTTYPE-SEARCHMARKER-GC(B): section2.get() returned a deleted/GCd child via dangling _searchMarker!'
+        )
+        assertInvariant(
+          section3.get(0) === undefined && section3.get(5) === undefined,
+          'BUG-CONTENTTYPE-SEARCHMARKER-GC(B): section3.get() returned deleted/GCd text via dangling _searchMarker!'
+        )
+        verifyDocInvariants(doc2, { expectNoPending: true, label: 'BUG-CONTENTTYPE-SEARCHMARKER-GC:B' })
+      } finally {
+        doc2.destroy()
+        doc1.destroy()
+      }
+    }
   }
 ]
 
