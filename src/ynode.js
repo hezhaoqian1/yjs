@@ -96,6 +96,20 @@ export const createAttributionFromAttributionItems = (attrs, deleted) => {
  */
 let globalSearchMarkerTimestamp = 0
 
+/**
+ * Shared frozen empty formats object used on unformatted fast paths (never mutated).
+ * @type {Object<string, any>}
+ */
+const emptyFormats = Object.freeze({})
+
+/**
+ * Allocation-free check for whether a format map is nullish or empty.
+ *
+ * @param {Object<string, any> | null | undefined} fmt
+ * @return {boolean}
+ */
+const isEmptyFormat = fmt => fmt == null || object.isEmpty(fmt)
+
 export class ItemTextListPosition {
   /**
    * @param {Item|null} left
@@ -142,6 +156,9 @@ export class ItemTextListPosition {
    * @function
    */
   formatText (transaction, parent, length, formats) {
+    const hasFormatChanges = !isEmptyFormat(formats)
+    const formatStartIndex = this.index
+    const formatLength = length
     minimizeFormatChanges(this, formats)
     const negatedFormats = insertFormats(transaction, parent, this, formats)
     // iterate until first non-format or null is found
@@ -218,6 +235,9 @@ export class ItemTextListPosition {
       throw new Error('Exceeded content range')
     }
     insertNegatedFormats(transaction, parent, this, negatedFormats)
+    if (hasFormatChanges && this.renderer === null && parent._searchMarker !== null && parent._searchMarker.length > 0) {
+      evictMarkersInRange(parent._searchMarker, formatStartIndex, formatStartIndex + formatLength)
+    }
   }
 }
 
@@ -354,7 +374,7 @@ export const insertContent = (transaction, parent, currPos, content, formats) =>
   minimizeFormatChanges(currPos, formats)
   const negatedFormats = insertFormats(transaction, parent, currPos, formats)
   let { left, right, index } = currPos
-  if (parent._searchMarker) {
+  if (currPos.renderer === null && parent._searchMarker !== null && parent._searchMarker.length > 0) {
     updateMarkerChanges(parent._searchMarker, currPos.index, content.getLength())
   }
   right = new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, right, right && right.id, parent, null, content)
@@ -420,6 +440,7 @@ const isRenderedCountable = c => c.content.isCountable() && (!c.deleted || c.att
  */
 export const deleteText = (transaction, currPos, length) => {
   const startLength = length
+  const delStart = currPos.index
   const startFormats = map.copy(currPos.currentFormats)
   const start = currPos.right
   const renderer = currPos.renderer
@@ -512,11 +533,13 @@ export const deleteText = (transaction, currPos, length) => {
   if (start) {
     cleanupFormattingGap(transaction, start, currPos.right, startFormats, currPos.currentFormats)
   }
-  const anchor = currPos.left || currPos.right
-  if (anchor !== null) {
-    const parent = /** @type {YNode<any>} */ (anchor.parent)
-    if (parent._searchMarker) {
-      updateMarkerChanges(parent._searchMarker, currPos.index, -startLength + length)
+  if (renderer === null && startLength > length) {
+    const anchor = currPos.left || currPos.right
+    if (anchor !== null) {
+      const parent = /** @type {YNode<any>} */ (anchor.parent)
+      if (parent._searchMarker !== null && parent._searchMarker.length > 0) {
+        updateMarkerChanges(parent._searchMarker, delStart, -startLength + length)
+      }
     }
   }
   return currPos
@@ -526,11 +549,13 @@ export class ArraySearchMarker {
   /**
    * @param {Item} p
    * @param {number} index
+   * @param {Map<string, any> | null} [formats=null]
    */
-  constructor (p, index) {
+  constructor (p, index, formats = null) {
     p.marker = true
     this.p = p
     this.index = index
+    this.formats = formats
     this.timestamp = globalSearchMarkerTimestamp++
   }
 }
@@ -546,29 +571,54 @@ const refreshMarkerTimestamp = marker => { marker.timestamp = globalSearchMarker
  * @param {ArraySearchMarker} marker
  * @param {Item} p
  * @param {number} index
+ * @param {Map<string, any> | null} [formats=null]
  */
-const overwriteMarker = (marker, p, index) => {
+const overwriteMarker = (marker, p, index, formats = null) => {
   marker.p.marker = false
   marker.p = p
   p.marker = true
   marker.index = index
+  marker.formats = formats
   marker.timestamp = globalSearchMarkerTimestamp++
+}
+
+/**
+ * Evict markers whose target item is deleted or whose index falls within `[startIndex, endIndex]`.
+ *
+ * @param {Array<ArraySearchMarker>} searchMarker
+ * @param {number} startIndex
+ * @param {number} endIndex
+ */
+const evictMarkersInRange = (searchMarker, startIndex, endIndex) => {
+  for (let i = searchMarker.length - 1; i >= 0; i--) {
+    const m = searchMarker[i]
+    if (m.p.deleted || (m.index >= startIndex && m.index <= endIndex)) {
+      m.p.marker = false
+      searchMarker.splice(i, 1)
+    }
+  }
 }
 
 /**
  * @param {Array<ArraySearchMarker>} searchMarker
  * @param {Item} p
  * @param {number} index
+ * @param {Map<string, any> | null} [formats=null]
  */
-const markPosition = (searchMarker, p, index) => {
+const markPosition = (searchMarker, p, index, formats = null) => {
   if (searchMarker.length >= maxSearchMarker) {
     // override oldest marker (we don't want to create more objects)
-    const marker = searchMarker.reduce((a, b) => a.timestamp < b.timestamp ? a : b)
-    overwriteMarker(marker, p, index)
-    return marker
+    let oldest = searchMarker[0]
+    for (let i = 1; i < searchMarker.length; i++) {
+      if (searchMarker[i].timestamp < oldest.timestamp) {
+        oldest = searchMarker[i]
+      }
+    }
+    overwriteMarker(oldest, p, index, formats)
+    return oldest
   } else {
     // create new marker
-    const pm = new ArraySearchMarker(p, index)
+    const pm = new ArraySearchMarker(p, index, formats)
     searchMarker.push(pm)
     return pm
   }
@@ -587,50 +637,131 @@ const markPosition = (searchMarker, p, index) => {
  * @param {number} index
  */
 export const findMarker = (yarray, index) => {
-  if (yarray._start === null || index === 0 || yarray._searchMarker === null) {
+  const searchMarker = yarray._searchMarker
+  if (yarray._start === null || index <= 0 || searchMarker === null) {
     return null
   }
-  const marker = yarray._searchMarker.length === 0 ? null : yarray._searchMarker.reduce((a, b) => math.abs(index - a.index) < math.abs(index - b.index) ? a : b)
+  const hasFormatting = yarray._hasFormatting
+  /**
+   * @type {ArraySearchMarker | null}
+   */
+  let marker = null
+  if (searchMarker.length > 0) {
+    if (hasFormatting) {
+      // Strictly <= index so formatted mode only walks forward (ContentFormat cannot be inverted backwards)
+      let bestIndex = -1
+      for (let i = 0; i < searchMarker.length; i++) {
+        const m = searchMarker[i]
+        if (m.index <= index && m.index > bestIndex) {
+          bestIndex = m.index
+          marker = m
+        }
+      }
+    } else {
+      let bestDist = index
+      for (let i = 0; i < searchMarker.length; i++) {
+        const m = searchMarker[i]
+        const dist = math.abs(index - m.index)
+        if (dist < bestDist) {
+          bestDist = dist
+          marker = m
+        }
+      }
+    }
+  }
   let p = yarray._start
   let pindex = 0
+  /**
+   * @type {Map<string, any> | null}
+   */
+  let formats = null
+  let formatsCopied = false
   if (marker !== null) {
     p = marker.p
     pindex = marker.index
+    formats = marker.formats
     refreshMarkerTimestamp(marker) // we used it, we might need to use it again
   }
   // iterate to right if possible
   while (p.right !== null && pindex < index) {
-    if (!p.deleted && p.countable) {
-      if (index < pindex + p.length) {
-        break
+    if (!p.deleted) {
+      if (p.countable) {
+        if (index < pindex + p.length) {
+          break
+        }
+        pindex += p.length
+      } else if (hasFormatting && p.content.constructor === ContentFormat) {
+        if (!formatsCopied) {
+          formats = formats !== null ? map.copy(formats) : new Map()
+          formatsCopied = true
+        }
+        updateCurrentFormats(/** @type {Map<string, any>} */ (formats), /** @type {ContentFormat} */ (p.content))
       }
-      pindex += p.length
     }
     p = p.right
   }
-  // iterate to left if necessary (might be that pindex > index)
-  while (p.left !== null && pindex > index) {
-    p = p.left
-    if (!p.deleted && p.countable) {
-      pindex -= p.length
+  // iterate to left if necessary (unformatted mode only)
+  if (!hasFormatting) {
+    while (p.left !== null && pindex > index) {
+      p = p.left
+      if (!p.deleted && p.countable) {
+        pindex -= p.length
+      }
+    }
+  } else {
+    // In formatted mode, advance past deleted/format items updating `formats` so the marker
+    // lands on an undeleted countable item.
+    while (p.right !== null && (p.deleted || !p.countable)) {
+      if (!p.deleted && p.content.constructor === ContentFormat) {
+        if (!formatsCopied) {
+          formats = formats !== null ? map.copy(formats) : new Map()
+          formatsCopied = true
+        }
+        updateCurrentFormats(/** @type {Map<string, any>} */ (formats), /** @type {ContentFormat} */ (p.content))
+      }
+      p = p.right
+    }
+    if (p.deleted || !p.countable) {
+      return null
     }
   }
   // we want to make sure that p can't be merged with left, because that would screw up everything
-  // in that cas just return what we have (it is most likely the best marker anyway)
-  // iterate to left until p can't be merged with left
-  while (p.left !== null && p.left.id.client === p.id.client && p.left.id.clock + p.left.length === p.id.clock) {
+  // iterate to left only across mergeable same-kind same-deleted siblings (never crosses ContentFormat)
+  while (
+    p.left !== null &&
+    p.left.deleted === p.deleted &&
+    p.left.content.constructor === p.content.constructor &&
+    p.left.id.client === p.id.client &&
+    p.left.id.clock + p.left.length === p.id.clock
+  ) {
     p = p.left
     if (!p.deleted && p.countable) {
       pindex -= p.length
     }
   }
-  if (marker !== null && math.abs(marker.index - pindex) < /** @type {any} */ (p.parent).length / maxSearchMarker) {
+  // Preserve 1-to-1 bijection between `Item.marker` and `searchMarker` entries
+  if (marker !== null && marker.p === p) {
+    return marker
+  }
+  if (p.marker) {
+    for (let i = 0; i < searchMarker.length; i++) {
+      const m = searchMarker[i]
+      if (m.p === p) {
+        refreshMarkerTimestamp(m)
+        return m
+      }
+    }
+  }
+  const storeFormats = (hasFormatting && formats !== null && formats.size > 0)
+    ? (formatsCopied ? formats : map.copy(formats))
+    : null
+  if (marker !== null && math.abs(marker.index - pindex) < yarray._length / maxSearchMarker) {
     // adjust existing marker
-    overwriteMarker(marker, p, pindex)
+    overwriteMarker(marker, p, pindex, storeFormats)
     return marker
   } else {
     // create new marker
-    return markPosition(yarray._searchMarker, p, pindex)
+    return markPosition(searchMarker, p, pindex, storeFormats)
   }
 }
 
@@ -644,22 +775,44 @@ export const findMarker = (yarray, index) => {
  * @param {number} len If insertion, len is positive. If deletion, len is negative.
  */
 export const updateMarkerChanges = (searchMarker, index, len) => {
+  if (len < 0) {
+    const delEnd = index - len
+    for (let i = searchMarker.length - 1; i >= 0; i--) {
+      const m = searchMarker[i]
+      if (m.p.deleted || (m.index >= index && m.index <= delEnd)) {
+        m.p.marker = false
+        searchMarker.splice(i, 1)
+      } else if (m.index > delEnd) {
+        m.index += len
+      }
+    }
+    return
+  }
   for (let i = searchMarker.length - 1; i >= 0; i--) {
     const m = searchMarker[i]
-    if (len > 0) {
+    if (m.p.deleted || !m.p.countable) {
+      if (m.formats !== null) {
+        m.p.marker = false
+        searchMarker.splice(i, 1)
+        continue
+      }
       /**
        * @type {Item|null}
        */
       let p = m.p
       p.marker = false
-      // Ideally we just want to do a simple position comparison, but this will only work if
-      // search markers don't point to deleted items for formats.
       // Iterate marker to prev undeleted countable position so we know what to do when updating a position
       while (p && (p.deleted || !p.countable)) {
         p = p.left
-        if (p && !p.deleted && p.countable) {
-          // adjust position. the loop should break now
-          m.index -= p.length
+        if (p && !p.deleted) {
+          if (p.countable) {
+            // adjust position. the loop should break now
+            m.index -= p.length
+          } else if (p.content.constructor === ContentFormat) {
+            // Do not cross a ContentFormat backwards when repairing a marker
+            p = null
+            break
+          }
         }
       }
       if (p === null || p.marker === true) {
@@ -670,8 +823,8 @@ export const updateMarkerChanges = (searchMarker, index, len) => {
       m.p = p
       p.marker = true
     }
-    if (index < m.index || (len > 0 && index === m.index)) { // a simple index <= m.index check would actually suffice
-      m.index = math.max(index, m.index + len)
+    if (index <= m.index) {
+      m.index += len
     }
   }
 }
@@ -788,10 +941,6 @@ export class YNode extends ObservableV2 {
      */
     this._dEH = createEventHandler()
     /**
-     * @type {null | Array<ArraySearchMarker>}
-     */
-    this._searchMarker = null
-    /**
      * Maintained deep-delta cache backing {@link YNode#delta}. `null` until `delta` is first
      * accessed; thereafter kept current on every event of this type (incrementally, by applying the
      * deep change) and re-diffed by {@link YNode#useRenderer}. Cleared by {@link YNode#clearCache}.
@@ -811,6 +960,12 @@ export class YNode extends ObservableV2 {
      * @type {Array<ArraySearchMarker>|null}
      */
     this._searchMarker = []
+    /**
+     * True while `applyDelta` is actively maintaining `_searchMarker` in-place (suppresses full
+     * marker invalidation in `Item.integrate`/`Item.delete` for local list edits).
+     * @type {boolean}
+     */
+    this._updatingMarkers = false
     /**
      * Whether this YText contains formats.
      * This flag is updated when a formatting item is integrated (see ContentFormat.integrate)
@@ -1713,47 +1868,81 @@ export class YNode extends ObservableV2 {
         f.modify(/** @type {any} */ (childFix ?? delta.create().done(false)), invFormat)
         fixLen = expectedIndex + 1
       }
-      const currPos = new ItemTextListPosition(null, this._start, 0, new Map(), renderer)
-      for (const op of d.children) {
-        if (delta.$textOp.check(op)) {
-          insertContent(transaction, /** @type {any} */ (this), currPos, new ContentString(op.insert), op.format || {})
-          expectedIndex += op.length
-        } else if (delta.$insertOp.check(op)) {
-          insertContentHelper(transaction, this, currPos, op.insert, op.format || {})
-          expectedIndex += op.length
-        } else if (delta.$retainOp.check(op)) {
-          currPos.formatText(transaction, /** @type {any} */ (this), op.retain, op.format || {})
-          expectedIndex += op.length
-        } else if (delta.$deleteOp.check(op)) {
-          deleteText(transaction, currPos, op.delete)
-        } else if (delta.$modifyOp.check(op)) {
-          let item = currPos.right
-          while (item !== null && rendererContentLength(renderer, item) === 0) { item = item.right }
-          if (item == null || item.content.constructor !== ContentType) { error.unexpectedCase() }
-          if (item.deleted) {
-            // deleted but rendered: revert instead of apply. Advance the cursor first (populating
-            // `currentFormats` with any markers up to the node) without applying `op.format`, then
-            // recurse — the child's deleted-guard applies nothing and returns the inverse.
-            currPos.formatText(transaction, /** @type {any} */ (this), 1, {})
-            /** @type {{ [k:string]: any }|undefined} */
-            let invFormat
-            for (const k in op.format) {
-              (invFormat ?? (invFormat = {}))[k] = currPos.currentFormats.get(k) ?? null
+      const manageMarkers = renderer === null && this._searchMarker !== null
+      if (manageMarkers) {
+        this._updatingMarkers = true
+      }
+      try {
+        /**
+         * @type {ItemTextListPosition | null}
+         */
+        let currPos = null
+        let isFirstOp = true
+        for (const op of d.children) {
+          if (isFirstOp) {
+            isFirstOp = false
+            if (manageMarkers && delta.$retainOp.check(op) && isEmptyFormat(op.format) && op.retain > 0 && op.retain <= this._length) {
+              const marker = findMarker(/** @type {any} */ (this), op.retain - 1)
+              if (marker !== null && marker.index < op.retain) {
+                const initFormats = marker.formats !== null ? map.copy(marker.formats) : new Map()
+                currPos = new ItemTextListPosition(marker.p.left, marker.p, marker.index, initFormats, null)
+                currPos.formatText(transaction, /** @type {any} */ (this), op.retain - marker.index, emptyFormats)
+                expectedIndex += op.length
+                continue
+              }
             }
-            const childFix = /** @type {ContentType} */ (item.content).type.applyDelta(op.value, origin, { renderer })
-            if (childFix !== null || invFormat !== undefined) {
-              appendModifyFix(childFix, invFormat)
-            }
-          } else {
-            const childFix = /** @type {ContentType} */ (item.content).type.applyDelta(op.value, origin, { renderer })
-            currPos.formatText(transaction, /** @type {any} */ (this), 1, op.format || {})
-            if (childFix !== null) {
-              appendModifyFix(childFix)
-            }
+            currPos = new ItemTextListPosition(null, this._start, 0, new Map(), renderer)
           }
-          expectedIndex += 1
-        } else {
-          error.unexpectedCase()
+          const pos = /** @type {ItemTextListPosition} */ (currPos)
+          if (delta.$textOp.check(op)) {
+            insertContent(transaction, /** @type {any} */ (this), pos, new ContentString(op.insert), op.format || emptyFormats)
+            expectedIndex += op.length
+          } else if (delta.$insertOp.check(op)) {
+            insertContentHelper(transaction, this, pos, op.insert, op.format || emptyFormats)
+            expectedIndex += op.length
+          } else if (delta.$retainOp.check(op)) {
+            pos.formatText(transaction, /** @type {any} */ (this), op.retain, op.format || emptyFormats)
+            expectedIndex += op.length
+          } else if (delta.$deleteOp.check(op)) {
+            deleteText(transaction, pos, op.delete)
+          } else if (delta.$modifyOp.check(op)) {
+            let item = pos.right
+            while (item !== null && rendererContentLength(renderer, item) === 0) { item = item.right }
+            if (item == null || item.content.constructor !== ContentType) { error.unexpectedCase() }
+            if (item.deleted) {
+              // deleted but rendered: revert instead of apply. Advance the cursor first (populating
+              // `currentFormats` with any markers up to the node) without applying `op.format`, then
+              // recurse — the child's deleted-guard applies nothing and returns the inverse.
+              pos.formatText(transaction, /** @type {any} */ (this), 1, emptyFormats)
+              /** @type {{ [k:string]: any }|undefined} */
+              let invFormat
+              for (const k in op.format) {
+                (invFormat ?? (invFormat = {}))[k] = pos.currentFormats.get(k) ?? null
+              }
+              const childFix = /** @type {ContentType} */ (item.content).type.applyDelta(op.value, origin, { renderer })
+              if (childFix !== null || invFormat !== undefined) {
+                appendModifyFix(childFix, invFormat)
+              }
+            } else {
+              const childFix = /** @type {ContentType} */ (item.content).type.applyDelta(op.value, origin, { renderer })
+              pos.formatText(transaction, /** @type {any} */ (this), 1, op.format || emptyFormats)
+              if (childFix !== null) {
+                appendModifyFix(childFix)
+              }
+            }
+            expectedIndex += 1
+          } else {
+            error.unexpectedCase()
+          }
+        }
+      } catch (err) {
+        if (manageMarkers && this._searchMarker !== null && this._searchMarker.length > 0) {
+          clearSearchMarkers(this._searchMarker)
+        }
+        throw err
+      } finally {
+        if (manageMarkers) {
+          this._updatingMarkers = false
         }
       }
       for (const op of d.attrs) {

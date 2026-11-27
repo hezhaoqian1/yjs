@@ -17,6 +17,23 @@ import {
 const isDevMode = env.getVariable('node_env') === 'development'
 
 /**
+ * Clear all search markers on `parent` and reset the `marker` bit on each referenced Item.
+ * Preserves `parent._searchMarker` as an array (never sets it to `null`) so formatted types
+ * retain search-marker acceleration.
+ *
+ * @param {YNode<any>} parent
+ */
+const clearParentSearchMarkers = parent => {
+  const searchMarker = parent._searchMarker
+  if (searchMarker !== null && searchMarker.length > 0) {
+    for (let i = 0; i < searchMarker.length; i++) {
+      searchMarker[i].p.marker = false
+    }
+    searchMarker.length = 0
+  }
+}
+
+/**
  * @todo This should return several items
  *
  * @param {StructStore} store
@@ -264,15 +281,21 @@ export class Item extends AbstractStruct {
         }
       }
       // adjust length of parent
-      if (this.parentSub === null && this.countable && !this.deleted) {
-        /** @type {YNode} */ (this.parent)._length += this.length
+      const parent = /** @type {YNode} */ (this.parent)
+      if (this.parentSub === null) {
+        if (this.countable && !this.deleted) {
+          parent._length += this.length
+        }
+        if (!parent._updatingMarkers) {
+          clearParentSearchMarkers(parent)
+        }
       }
       addStructToIdSet(transaction.insertSet, this)
       transaction.doc.store.add(this)
       this.content.integrate(transaction, this)
       // add parent to transaction.changed
-      addChangedTypeToTransaction(transaction, /** @type {YNode} */ (this.parent), this.parentSub)
-      if ((/** @type {YNode} */ (this.parent)._item !== null && /** @type {YNode} */ (this.parent)._item.deleted) || (this.parentSub !== null && this.right !== null)) {
+      addChangedTypeToTransaction(transaction, parent, this.parentSub)
+      if ((parent._item !== null && parent._item.deleted) || (this.parentSub !== null && this.right !== null)) {
         // delete if parent is deleted or if this is not the current attribute value of parent
         this.delete(transaction)
       }
@@ -375,8 +398,13 @@ export class Item extends AbstractStruct {
     if (!this.deleted) {
       const parent = /** @type {YNode} */ (this.parent)
       // adjust the length of parent
-      if (this.countable && this.parentSub === null) {
-        parent._length -= this.length
+      if (this.parentSub === null) {
+        if (this.countable) {
+          parent._length -= this.length
+        }
+        if (!parent._updatingMarkers) {
+          clearParentSearchMarkers(parent)
+        }
       }
       this.markDeleted()
       transaction.deleteSet.add(this.id.client, this.id.clock, this.length)
@@ -397,6 +425,9 @@ export class Item extends AbstractStruct {
       return
     }
     this.content.gc(tr)
+    if (this.marker && this.parent !== null) {
+      clearParentSearchMarkers(/** @type {YNode} */ (this.parent))
+    }
     if (parentGCd) {
       replaceStruct(tr, this, new GC(this.id, this.length))
     } else {
@@ -1160,14 +1191,7 @@ export class ContentFormat {
    * @param {Item} item
    */
   integrate (_transaction, item) {
-    // @todo searchmarker are currently unsupported for rich text documents
     const p = /** @type {import('../ynode.js').YNode<any>} */ (item.parent)
-    if (p._searchMarker !== null) {
-      for (let i = 0; i < p._searchMarker.length; i++) {
-        p._searchMarker[i].p.marker = false
-      }
-      p._searchMarker = null
-    }
     p._hasFormatting = true
   }
 

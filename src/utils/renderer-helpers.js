@@ -151,12 +151,15 @@ export const $renderer = AbstractRenderer.prototype.$type = s.$type('y:renderer'
  * @return {number}
  */
 export const rendererContentLength = (renderer, item) => {
+  if (renderer === null) {
+    return (item.deleted || !item.countable) ? 0 : item.length
+  }
   const mode = rendererMode(renderer, item)
   return mode === 2
     ? 0
     : (mode === 1
-        ? /** @type {AbstractRenderer} */ (renderer).contentLength(item)
-        : ((item.deleted || !item.content.isCountable()) ? 0 : item.length))
+        ? renderer.contentLength(item)
+        : ((item.deleted || !item.countable) ? 0 : item.length))
 }
 
 /**
