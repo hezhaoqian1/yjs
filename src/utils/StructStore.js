@@ -127,7 +127,14 @@ export const getStateVector = store => {
     sm.set(client, struct.id.clock + struct.length)
   })
   store.skips.clients.forEach((range, client) => {
-    sm.set(client, range.getIds()[0].clock)
+    const ids = range.getIds()
+    if (ids.length === 0) return
+    const clock = ids[0].clock
+    if (clock === 0) {
+      sm.delete(client)
+    } else {
+      sm.set(client, clock)
+    }
   })
   return sm
 }

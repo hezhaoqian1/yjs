@@ -22,6 +22,31 @@ const maxV2BlocksBase = 16384
 const maxV2BlocksPerByte = 256
 
 /**
+ * Strip leading and trailing `Skip` blocks from `blockRange.refs`; delete `client` from `clients`
+ * if no non-`Skip` blocks remain.
+ *
+ * @param {Map<number, BlockRange>} clients
+ * @param {number} client
+ * @param {BlockRange} blockRange
+ */
+const trimBlockRangeSkips = (clients, client, blockRange) => {
+  const structs = blockRange.refs
+  let firstNonSkip = 0
+  while (firstNonSkip < structs.length && structs[firstNonSkip].constructor === Skip) {
+    firstNonSkip++
+  }
+  let lastNonSkip = structs.length
+  while (lastNonSkip > firstNonSkip && structs[lastNonSkip - 1].constructor === Skip) {
+    lastNonSkip--
+  }
+  if (firstNonSkip === lastNonSkip) {
+    clients.delete(client)
+  } else if (firstNonSkip > 0 || lastNonSkip < structs.length) {
+    blockRange.refs = structs.slice(firstNonSkip, lastNonSkip)
+  }
+}
+
+/**
  * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder The decoder object to read data from.
  * @return {BlockSet}
  *
@@ -115,6 +140,7 @@ export const readBlockSet = (decoder) => {
       }
     }
   }
+  clientRefs.clients.forEach((blockRange, client) => trimBlockRangeSkips(clientRefs.clients, client, blockRange))
   return clientRefs
 }
 
@@ -184,8 +210,9 @@ export class BlockSet {
     const clientids = this.clients.size < exclude.clients.size ? this.clients.keys() : exclude.clients.keys()
     for (const client of clientids) {
       const range = exclude.clients.get(client)
-      const structs = this.clients.get(client)?.refs
-      if (range == null || structs == null || structs.length === 0) continue
+      const blockRange = this.clients.get(client)
+      if (range == null || blockRange == null || blockRange.refs.length === 0) continue
+      const structs = blockRange.refs
       const startClock = structs[0].id.clock
       const idranges = range.getIds()
       for (let i = 0; i < idranges.length; i++) {
@@ -207,6 +234,7 @@ export class BlockSet {
           structs.splice(startIndex + 1, d - 1)
         }
       }
+      trimBlockRangeSkips(this.clients, client, blockRange)
     }
   }
 
@@ -282,7 +310,9 @@ export class BlockSet {
               if (nclock < clock) {
                 nblock = sliceStruct(nblock, clock - nclock)
               } else if (nclock > clock) {
-                result.push(new Skip(new ID(clientid, clock), nclock - clock))
+                if (result.length > 0) {
+                  result.push(new Skip(new ID(clientid, clock), nclock - clock))
+                }
                 clock = nclock
               }
               result.push(nblock)
@@ -298,7 +328,7 @@ export class BlockSet {
               }
             }
             if (lblock === undefined) break
-            if (clock < end) {
+            if (clock < end && result.length > 0) {
               result.push(new Skip(new ID(clientid, clock), end - clock))
             }
             result.push(lblock)

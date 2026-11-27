@@ -229,7 +229,7 @@ export const encodeStateVectorFromUpdateV2 = (update, YEncoder = IdSetEncoderV2,
     let size = 0
     let currClient = curr.id.client
     let stopCounting = curr.id.clock !== 0 // must start at 0
-    let currClock = stopCounting ? 0 : curr.id.clock + curr.length
+    let currClock = 0
     for (; curr !== null; curr = updateDecoder.next()) {
       if (currClient !== curr.id.client) {
         if (currClock !== 0) {

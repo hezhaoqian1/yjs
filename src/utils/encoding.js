@@ -53,8 +53,8 @@ export const writeClientsStructs = (encoder, store, _sm) => {
       sm.set(client, clock)
     }
   })
-  getStateVector(store).forEach((_clock, client) => {
-    if (!_sm.has(client)) {
+  store.clients.forEach((structs, client) => {
+    if (!_sm.has(client) && structs.length > 0) {
       sm.set(client, 0)
     }
   })
