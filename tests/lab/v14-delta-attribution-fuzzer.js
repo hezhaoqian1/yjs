@@ -1053,15 +1053,15 @@ const runSnapshotWireAlgebraOracle = (seed, cfg, trace) => {
       const um = i === 0 ? new Y.UndoManager([doc.get('root'), doc.get('rich')], { captureTimeout: 0 }) : null
       peers.push({ doc, um, inbox: [] })
       doc.on('update', (u, origin) => {
-        allV1.push(u)
         if (origin === NETWORK_ORIGIN) return
+        allV1.push(u)
         for (let j = 0; j < peers.length; j++) {
           if (j !== i && prng.bool(gen)) peers[j].inbox.push({ fmt: 'v1', data: u })
         }
       })
       doc.on('updateV2', (u2, origin) => {
-        allV2.push(u2)
         if (origin === NETWORK_ORIGIN) return
+        allV2.push(u2)
         for (let j = 0; j < peers.length; j++) {
           if (j !== i && prng.bool(gen)) peers[j].inbox.push({ fmt: 'v2', data: u2 })
         }

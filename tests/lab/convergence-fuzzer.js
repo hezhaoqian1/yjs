@@ -494,20 +494,23 @@ const verifySnapshotAndContentIds = doc => {
     const inter2 = Y.intersectUpdateWithContentIdsV2(u2, cidsFull)
     const d1 = new Y.Doc({ gc: doc.gc })
     const d2 = new Y.Doc({ gc: doc.gc })
-    Y.applyUpdate(d1, inter1)
-    Y.applyUpdateV2(d2, inter2)
-    verifyDocInvariants(d1, { expectNoPending: true, label: 'intersect-v1' })
-    verifyDocInvariants(d2, { expectNoPending: true, label: 'intersect-v2' })
-    assertInvariant(
-      equalBytes(Y.encodeStateVector(doc), Y.encodeStateVector(d1)),
-      'intersectUpdateWithContentIds V1 state vector mismatch'
-    )
-    assertInvariant(
-      equalBytes(Y.encodeStateVector(doc), Y.encodeStateVector(d2)),
-      'intersectUpdateWithContentIds V2 state vector mismatch'
-    )
-    d1.destroy()
-    d2.destroy()
+    try {
+      Y.applyUpdate(d1, inter1)
+      Y.applyUpdateV2(d2, inter2)
+      verifyDocInvariants(d1, { expectNoPending: true, label: 'intersect-v1' })
+      verifyDocInvariants(d2, { expectNoPending: true, label: 'intersect-v2' })
+      assertInvariant(
+        equalBytes(Y.encodeStateVector(doc), Y.encodeStateVector(d1)),
+        'intersectUpdateWithContentIds V1 state vector mismatch'
+      )
+      assertInvariant(
+        equalBytes(Y.encodeStateVector(doc), Y.encodeStateVector(d2)),
+        'intersectUpdateWithContentIds V2 state vector mismatch'
+      )
+    } finally {
+      d1.destroy()
+      d2.destroy()
+    }
   }
 }
 

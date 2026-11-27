@@ -427,32 +427,33 @@ const verifyAlgebraicLawsOnTriple = ({ uA, uB, uC, format, gc, label }) => {
   const apply = format === 'v1' ? Y.applyUpdate : Y.applyUpdateV2
   const merge = format === 'v1' ? Y.mergeUpdates : Y.mergeUpdatesV2
 
-  // 1. Commutativity: apply(uA); apply(uB) === apply(uB); apply(uA)
   const docAB = new Y.Doc({ gc })
   const docBA = new Y.Doc({ gc })
-  apply(docAB, uA)
-  apply(docAB, uB)
-  apply(docBA, uB)
-  apply(docBA, uA)
-
-  // 2. Associativity: merge([merge([uA, uB]), uC]) === merge([uA, merge([uB, uC])])
-  const leftAssoc = merge([merge([uA, uB]), uC])
-  const rightAssoc = merge([uA, merge([uB, uC])])
   const docLeft = new Y.Doc({ gc })
   const docRight = new Y.Doc({ gc })
-  apply(docLeft, leftAssoc)
-  apply(docRight, rightAssoc)
-
-  // 3. Idempotency: apply(uA) === apply(uA); apply(uA) === apply(merge([uA, uA]))
   const docOnce = new Y.Doc({ gc })
   const docTwice = new Y.Doc({ gc })
   const docDupMerge = new Y.Doc({ gc })
-  apply(docOnce, uA)
-  apply(docTwice, uA)
-  apply(docTwice, uA)
-  apply(docDupMerge, merge([uA, uA]))
 
   try {
+    // 1. Commutativity: apply(uA); apply(uB) === apply(uB); apply(uA)
+    apply(docAB, uA)
+    apply(docAB, uB)
+    apply(docBA, uB)
+    apply(docBA, uA)
+
+    // 2. Associativity: merge([merge([uA, uB]), uC]) === merge([uA, merge([uB, uC])])
+    const leftAssoc = merge([merge([uA, uB]), uC])
+    const rightAssoc = merge([uA, merge([uB, uC])])
+    apply(docLeft, leftAssoc)
+    apply(docRight, rightAssoc)
+
+    // 3. Idempotency: apply(uA) === apply(uA); apply(uA) === apply(merge([uA, uA]))
+    apply(docOnce, uA)
+    apply(docTwice, uA)
+    apply(docTwice, uA)
+    apply(docDupMerge, merge([uA, uA]))
+
     assertLawEquivalence([docAB, docBA], `${label}(${format}):commutativity`)
     assertLawEquivalence([docLeft, docRight], `${label}(${format}):associativity`)
     assertLawEquivalence([docOnce, docTwice, docDupMerge], `${label}(${format}):idempotency`)

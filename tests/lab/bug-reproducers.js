@@ -1807,6 +1807,74 @@ export const REPRODUCERS = [
         `BUG-IDMAP-INTERSECT(B): diffIdMap aliased src.attrs/attrsH — diffed.add() mutated src (attrs.size=${src.attrs.size}, attrsH.size=${src.attrsH.size}, expected 1)`
       )
     }
+  },
+  {
+    id: 'BUG-IDMAP-ADD-DUP',
+    title: 'IdMap.prototype.add and readIdMap do not deduplicate equal ContentAttributes, causing idmapAttrsEqual([a,a],[a,b])===true to silently erase adjacent attributes',
+    targetPr: 'PR #5',
+    run: () => {
+      // Part A: IdMap.prototype.add with duplicate equal ContentAttributes followed by adjacent [a, b]
+      /** @type {Y.IdMap<string>} */
+      const m = Y.createIdMap()
+      const a1 = Y.createContentAttribute('insert', 'alice')
+      const a2 = Y.createContentAttribute('insert', 'alice')
+      const b = Y.createContentAttribute('insert', 'bob')
+      m.add(1, 0, 5, [a1, a2])
+      m.add(1, 5, 5, [a1, b])
+
+      const attrsA0 = m.slice(1, 0, 5)[0]?.attrs
+      const attrsA1 = m.slice(1, 5, 5)[0]?.attrs
+      assertInvariant(
+        attrsA0 !== null && attrsA0 !== undefined && attrsA0.length === 1 && attrsA0[0].val === 'alice',
+        `BUG-IDMAP-ADD-DUP(A): [0,5) retained duplicate attrs (len=${attrsA0 ? attrsA0.length : -1}, vals=${attrsA0 ? attrsA0.map(x => x.val).join(',') : 'null'}, expected 1 'alice')`
+      )
+      assertInvariant(
+        attrsA1 !== null && attrsA1 !== undefined &&
+        attrsA1.length === 2 &&
+        attrsA1.some(x => x.val === 'alice') &&
+        attrsA1.some(x => x.val === 'bob'),
+        `BUG-IDMAP-ADD-DUP(A): [5,10) silently lost 'bob' via idmapAttrsEqual([a,a],[a,b])===true (vals=${attrsA1 ? attrsA1.map(x => x.val).join(',') : 'null'})`
+      )
+
+      // Part B: Craft valid binary IdMap V2 payload with duplicate attrId [0, 0] on [0,5) adjacent to [0, 1] on [5,10)
+      const enc = encoding.createEncoder()
+      encoding.writeVarUint(enc, 1) // numClients = 1
+      encoding.writeVarUint(enc, 1) // clientDiff = 1 (client = 1)
+      encoding.writeVarUint(enc, 2) // numRanges = 2
+      // Range 0: clock=0 (diff=0), len=5 (encoded=4), attrs=[attrId 0 ('insert','alice'), attrId 0]
+      encoding.writeVarUint(enc, 0)
+      encoding.writeVarUint(enc, 4)
+      encoding.writeVarUint(enc, 2) // attrsLen = 2
+      encoding.writeVarUint(enc, 0) // attrId = 0 (new)
+      encoding.writeVarUint(enc, 0) // attrNameId = 0 (new)
+      encoding.writeVarString(enc, 'insert')
+      encoding.writeAny(enc, 'alice')
+      encoding.writeVarUint(enc, 0) // duplicate attrId = 0
+      // Range 1: clock=5 (diff=0 from dsCurVal=5), len=5 (encoded=4), attrs=[attrId 0, attrId 1 ('insert','bob')]
+      encoding.writeVarUint(enc, 0)
+      encoding.writeVarUint(enc, 4)
+      encoding.writeVarUint(enc, 2) // attrsLen = 2
+      encoding.writeVarUint(enc, 0) // attrId = 0 (known)
+      encoding.writeVarUint(enc, 1) // attrId = 1 (new)
+      encoding.writeVarUint(enc, 0) // attrNameId = 0 (known: 'insert')
+      encoding.writeAny(enc, 'bob')
+
+      /** @type {Y.IdMap<string>} */
+      const decoded = Y.decodeIdMap(encoding.toUint8Array(enc))
+      const attrsB0 = decoded.slice(1, 0, 5)[0]?.attrs
+      const attrsB1 = decoded.slice(1, 5, 5)[0]?.attrs
+      assertInvariant(
+        attrsB0 !== null && attrsB0 !== undefined && attrsB0.length === 1 && attrsB0[0].val === 'alice',
+        `BUG-IDMAP-ADD-DUP(B): decodeIdMap retained duplicate attrId on [0,5) (len=${attrsB0 ? attrsB0.length : -1}, vals=${attrsB0 ? attrsB0.map(x => x.val).join(',') : 'null'})`
+      )
+      assertInvariant(
+        attrsB1 !== null && attrsB1 !== undefined &&
+        attrsB1.length === 2 &&
+        attrsB1.some(x => x.val === 'alice') &&
+        attrsB1.some(x => x.val === 'bob'),
+        `BUG-IDMAP-ADD-DUP(B): decodeIdMap silently erased 'bob' on [5,10) (vals=${attrsB1 ? attrsB1.map(x => x.val).join(',') : 'null'})`
+      )
+    }
   }
 ]
 
