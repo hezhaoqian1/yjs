@@ -99,6 +99,13 @@ export class IdRanges {
      */
     this._lastIsUsed = false
     /**
+     * True if attributed ranges (`AttrRange`) have been added into this `IdRanges` (e.g. via
+     * `insertIntoIdMap` or `IdMap#add` on a client first populated from an `IdSet`). When true,
+     * `getIds()` sorts and merges via {@link sortAndMergeAttrRanges} so attributes are preserved.
+     * @type {boolean}
+     */
+    this._hasAttrs = false
+    /**
      * @private
      */
     this._ids = ids
@@ -109,6 +116,7 @@ export class IdRanges {
     cpy.sorted = this.sorted
     this._lastIsUsed = true
     cpy._lastIsUsed = true
+    cpy._hasAttrs = this._hasAttrs
     return cpy
   }
 
@@ -117,6 +125,12 @@ export class IdRanges {
    * @param {number} length
    */
   add (clock, length) {
+    if (this._hasAttrs) {
+      this.sorted = false
+      this._lastIsUsed = true
+      this._ids.push(new IdRange(clock, length))
+      return
+    }
     const last = this._ids[this._ids.length - 1]
     if (last != null && last.clock + last.len === clock) {
       if (this._lastIsUsed) {
@@ -132,6 +146,36 @@ export class IdRanges {
   }
 
   /**
+   * Append an attributed range into this `IdRanges` container (used by `IdMap#add` when a client
+   * entry was initially created from an `IdSet`).
+   *
+   * @param {number} clock
+   * @param {number} length
+   * @param {Array<ContentAttribute<any>>} attrs
+   */
+  addAttrRange (clock, length, attrs) {
+    if (length === 0) return
+    this._hasAttrs = true
+    this.sorted = false
+    this._lastIsUsed = true
+    this._ids.push(/** @type {IdRange} */ (/** @type {unknown} */ (new AttrRange(clock, length, attrs))))
+  }
+
+  /**
+   * Append attributed ranges into this `IdRanges` container (used by `insertIntoIdMap` while
+   * preserving `IdRanges` container identity).
+   *
+   * @param {Array<AttrRange<any>>} ranges
+   */
+  appendAttrRanges (ranges) {
+    if (ranges.length === 0) return
+    this._hasAttrs = true
+    this.sorted = false
+    this._lastIsUsed = true
+    array.appendTo(this._ids, /** @type {Array<IdRange>} */ (/** @type {unknown} */ (ranges)))
+  }
+
+  /**
    * Return the list of immutable id ranges, sorted and merged.
    */
   getIds () {
@@ -139,30 +183,34 @@ export class IdRanges {
     this._lastIsUsed = true
     if (!this.sorted) {
       this.sorted = true
-      ids.sort((a, b) => a.clock - b.clock)
-      // merge items without filtering or splicing the array
-      // i is the current pointer
-      // j refers to the current insert position for the pointed item
-      // try to merge dels[i] into dels[j-1] or set dels[j]=dels[i]
-      let i, j
-      for (i = 1, j = 1; i < ids.length; i++) {
-        const left = ids[j - 1]
-        const right = ids[i]
-        if (left.clock + left.len >= right.clock) {
-          const r = right.clock + right.len - left.clock
-          if (left.len < r) {
-            ids[j - 1] = new IdRange(left.clock, r)
+      if (this._hasAttrs) {
+        sortAndMergeAttrRanges(ids)
+      } else {
+        ids.sort((a, b) => a.clock - b.clock)
+        // merge items without filtering or splicing the array
+        // i is the current pointer
+        // j refers to the current insert position for the pointed item
+        // try to merge dels[i] into dels[j-1] or set dels[j]=dels[i]
+        let i, j
+        for (i = 1, j = 1; i < ids.length; i++) {
+          const left = ids[j - 1]
+          const right = ids[i]
+          if (left.clock + left.len >= right.clock) {
+            const r = right.clock + right.len - left.clock
+            if (left.len < r) {
+              ids[j - 1] = new IdRange(left.clock, r)
+            }
+          } else if (left.len === 0) {
+            ids[j - 1] = right
+          } else {
+            if (j < i) {
+              ids[j] = right
+            }
+            j++
           }
-        } else if (left.len === 0) {
-          ids[j - 1] = right
-        } else {
-          if (j < i) {
-            ids[j] = right
-          }
-          j++
         }
+        ids.length = ids.length === 0 ? 0 : (ids[j - 1].len === 0 ? j - 1 : j)
       }
-      ids.length = ids.length === 0 ? 0 : (ids[j - 1].len === 0 ? j - 1 : j)
     }
     return ids
   }
@@ -600,7 +648,9 @@ export const mergeIdSets = idSets => {
             array.appendTo(ids, nextIds.getIds())
           }
         }
-        merged.clients.set(client, new IdRanges(ids))
+        const mergedRanges = new IdRanges(ids)
+        mergedRanges._lastIsUsed = true
+        merged.clients.set(client, mergedRanges)
       }
     })
   }
@@ -633,12 +683,64 @@ const _insertIntoIdSet = (dest, src) => {
 export const insertIntoIdSet = _insertIntoIdSet
 
 /**
- * Note that `src` may be an `IdSet`, in which case `dest` ends up holding `IdRanges` - which carry
+ * Note that `src` may be an `IdSet`, in which case `dest` may hold `IdRanges` - which carry
  * no attributes ({@link IdRange#attrs} is `[]`). This is by design; {@link $idMap} tolerates it.
+ * When attributed ranges are later inserted for the same client, `IdRanges._hasAttrs` is set so
+ * attributes are interned and preserved across sorting/merging without changing container class.
  *
- * @type {(dest: IdMap<any>, src: IdMap<any>|IdSet) => void}
+ * @param {IdMap<any>} dest
+ * @param {IdMap<any> | IdSet} src
  */
-export const insertIntoIdMap = _insertIntoIdSet
+export const insertIntoIdMap = (dest, src) => {
+  if (src instanceof IdSet) {
+    src.clients.forEach((srcRanges, client) => {
+      const targetRanges = /** @type {AttrRanges<any> | IdRanges | undefined} */ (/** @type {unknown} */ (dest.clients.get(client)))
+      if (targetRanges != null) {
+        const srcIds = srcRanges.getIds()
+        if (targetRanges instanceof IdRanges) {
+          array.appendTo(targetRanges.getIds(), srcIds)
+          targetRanges.sorted = false
+        } else {
+          const targetIds = targetRanges.getIds()
+          for (let i = 0; i < srcIds.length; i++) {
+            const r = srcIds[i]
+            targetIds.push(new AttrRange(r.clock, r.len, []))
+          }
+          targetRanges.sorted = false
+        }
+      } else {
+        // order first
+        srcRanges.getIds()
+        dest.clients.set(client, /** @type {any} */ (srcRanges.copy()))
+      }
+    })
+    return
+  }
+  /**
+   * @type {Map<ContentAttribute<any>, ContentAttribute<any>>}
+   */
+  const attrMapper = new Map()
+  src.clients.forEach((srcRanges, client) => {
+    const srcIds = srcRanges.getIds()
+    /**
+     * @type {Array<AttrRange<any>>}
+     */
+    const mapped = new Array(srcIds.length)
+    for (let i = 0; i < srcIds.length; i++) {
+      const r = srcIds[i]
+      mapped[i] = new AttrRange(r.clock, r.len, mapAttrsWithCache(dest, attrMapper, r.attrs))
+    }
+    const targetRanges = /** @type {AttrRanges<any> | IdRanges | undefined} */ (/** @type {unknown} */ (dest.clients.get(client)))
+    if (targetRanges == null) {
+      dest.clients.set(client, new AttrRanges(mapped))
+    } else if (targetRanges instanceof IdRanges) {
+      targetRanges.appendAttrRanges(mapped)
+    } else {
+      array.appendTo(targetRanges.getIds(), mapped)
+      targetRanges.sorted = false
+    }
+  })
+}
 
 /**
  * @todo rename to excludeIdSet | excludeIdMap
@@ -666,14 +768,14 @@ export const insertIntoIdMap = _insertIntoIdSet
  * @return {Set}
  */
 export const _diffSet = (set, exclude) => {
+  const isSet = set instanceof IdSet
   /**
    * @type {Set}
    */
-  const res = /** @type {any } */ (set instanceof IdSet ? new IdSet() : new IdMap())
-  const Ranges = set instanceof IdSet ? IdRanges : AttrRanges
+  const res = /** @type {any} */ (isSet ? new IdSet() : new IdMap())
   set.clients.forEach((_setRanges, client) => {
     /**
-     * @type {Array<IdRange>}
+     * @type {Array<IdRange | AttrRange<any>>}
      */
     let resRanges = []
     const _excludedRanges = exclude.clients.get(client)
@@ -683,8 +785,11 @@ export const _diffSet = (set, exclude) => {
     } else {
       const excludedRanges = _excludedRanges.getIds()
       let i = 0; let j = 0
+      /**
+       * @type {IdRange | AttrRange<any> | undefined}
+       */
       let currRange = setRanges[0]
-      while (i < setRanges.length && j < excludedRanges.length) {
+      while (i < setRanges.length && j < excludedRanges.length && currRange != null) {
         const e = excludedRanges[j]
         if (currRange.clock + currRange.len <= e.clock) { // no overlapping, use next range item
           if (currRange.len > 0) resRanges.push(currRange)
@@ -693,6 +798,7 @@ export const _diffSet = (set, exclude) => {
           j++
         } else if (e.clock <= currRange.clock) { // exclude laps into range (we already know that the ranges somehow collide)
           const newClock = e.clock + e.len
+          /** @type {number} */
           const newLen = currRange.clock + currRange.len - newClock
           if (newLen > 0) {
             currRange = currRange.copyWith(newClock, newLen)
@@ -703,6 +809,7 @@ export const _diffSet = (set, exclude) => {
           }
         } else { // currRange.clock < e.clock -- range laps into exclude => adjust len
           // beginning can't be empty, add it to the result
+          /** @type {number} */
           const nextLen = e.clock - currRange.clock
           resRanges.push(currRange.copyWith(currRange.clock, nextLen))
           // retain the remaining length after exclude in currRange
@@ -719,8 +826,18 @@ export const _diffSet = (set, exclude) => {
         resRanges.push(setRanges[i++])
       }
     }
-    // @ts-ignore
-    if (resRanges.length > 0) res.clients.set(client, /** @type {any} */ (new Ranges(resRanges)))
+    if (resRanges.length > 0) {
+      if (isSet) {
+        const ranges = new IdRanges(/** @type {Array<IdRange>} */ (resRanges))
+        ranges._lastIsUsed = true
+        const resSet = /** @type {IdSet} */ (res)
+        resSet.clients.set(client, ranges)
+      } else {
+        const attrRanges = resRanges.map(r => r instanceof AttrRange ? r : new AttrRange(r.clock, r.len, r.attrs))
+        const resMap = /** @type {IdMap<any>} */ (res)
+        resMap.clients.set(client, new AttrRanges(attrRanges))
+      }
+    }
   })
   return res
 }
@@ -744,20 +861,25 @@ export const diffIdSet = _diffSet
  * @return {SetA extends IdMap<infer A> ? (SetB extends IdMap<infer B> ? IdMap<A | B> : IdMap<A>) : IdSet}
  */
 export const _intersectSets = (setA, setB) => {
+  const isSet = setA instanceof IdSet
   /**
    * @type {IdMap<any> | IdSet}
    */
-  const res = /** @type {any } */ (setA instanceof IdSet ? new IdSet() : new IdMap())
-  const Ranges = setA instanceof IdSet ? IdRanges : AttrRanges
+  const res = isSet ? new IdSet() : new IdMap()
+  /**
+   * @type {Map<ContentAttribute<any>, ContentAttribute<any>> | null}
+   */
+  const attrMapper = isSet ? null : new Map()
   setA.clients.forEach((_aRanges, client) => {
-    /**
-     * @type {Array<IdRange>}
-     */
-    const resRanges = []
     const _bRanges = setB.clients.get(client)
+    if (_bRanges == null) return
     const aRanges = _aRanges.getIds()
-    if (_bRanges != null) {
-      const bRanges = _bRanges.getIds()
+    const bRanges = _bRanges.getIds()
+    if (isSet) {
+      /**
+       * @type {Array<IdRange>}
+       */
+      const resRanges = []
       for (let a = 0, b = 0; a < aRanges.length && b < bRanges.length;) {
         const aRange = aRanges[a]
         const bRange = bRanges[b]
@@ -765,10 +887,7 @@ export const _intersectSets = (setA, setB) => {
         const clock = math.max(aRange.clock, bRange.clock)
         const len = math.min(aRange.len - (clock - aRange.clock), bRange.len - (clock - bRange.clock))
         if (len > 0) {
-          resRanges.push(aRange instanceof AttrRange
-            ? new AttrRange(clock, len, /** @type {Array<any>} */ (aRange.attrs).concat(bRange.attrs))
-            : new IdRange(clock, len)
-          )
+          resRanges.push(new IdRange(clock, len))
         }
         if (aRange.clock + aRange.len < bRange.clock + bRange.len) {
           a++
@@ -776,9 +895,40 @@ export const _intersectSets = (setA, setB) => {
           b++
         }
       }
+      if (resRanges.length > 0) {
+        /** @type {IdSet} */ (res).clients.set(client, new IdRanges(resRanges))
+      }
+    } else {
+      const resMap = /** @type {IdMap<any>} */ (res)
+      const mapper = /** @type {Map<ContentAttribute<any>, ContentAttribute<any>>} */ (attrMapper)
+      /**
+       * @type {Array<AttrRange<any>>}
+       */
+      const resRanges = []
+      for (let a = 0, b = 0; a < aRanges.length && b < bRanges.length;) {
+        const aRange = aRanges[a]
+        const bRange = bRanges[b]
+        // construct overlap
+        const clock = math.max(aRange.clock, bRange.clock)
+        const len = math.min(aRange.len - (clock - aRange.clock), bRange.len - (clock - bRange.clock))
+        if (len > 0) {
+          const aAttrs = aRange.attrs
+          const bAttrs = bRange.attrs
+          const joined = (aAttrs.length === 0 && bAttrs.length === 0)
+            ? []
+            : mapAttrsWithCache(resMap, mapper, bAttrs.length === 0 ? aAttrs : (aAttrs.length === 0 ? bAttrs : aAttrs.concat(bAttrs)))
+          resRanges.push(new AttrRange(clock, len, joined))
+        }
+        if (aRange.clock + aRange.len < bRange.clock + bRange.len) {
+          a++
+        } else {
+          b++
+        }
+      }
+      if (resRanges.length > 0) {
+        resMap.clients.set(client, new AttrRanges(resRanges))
+      }
     }
-    // @ts-ignore
-    if (resRanges.length > 0) res.clients.set(client, /** @type {any} */ (new Ranges(resRanges)))
   })
   return /** @type {any} */ (res)
 }
@@ -1129,6 +1279,83 @@ export const createMaybeAttrRange = (clock, len, attrs) => new AttrRange(clock, 
 const idmapAttrRangeJoin = (a, b) => a.concat(b.filter(attr => !idmapAttrsHas(a, attr)))
 
 /**
+ * Sort, split overlaps (joining attributes), and merge adjacent equal-attribute ranges in place.
+ *
+ * @param {Array<IdRange | AttrRange<any>>} ids
+ */
+const sortAndMergeAttrRanges = ids => {
+  ids.sort((a, b) => a.clock - b.clock)
+  /**
+   * algorithm thoughts:
+   * - sort (by clock AND by length), bigger length is to the right (or not, we can't make
+   *   assumptions abouth length after long length has been split)
+   * -- maybe better: sort by clock+length. Then split items from right to left. This way, items are always
+   *   in the right order. But I also need to swap if left items is smaller after split
+   *   --- thought: there is no way to go around swapping. Unless, for each item from left to
+   *   right, when I have to split because one of the look-ahead items is overlapping, i split
+   *   it and merge the attributes into the following ones (that I also need to split). Best is
+   *   probably left to right with lookahead.
+   * - left to right, split overlapping items so that we can make the assumption that either an
+   *   item is overlapping with the next 1-on-1 or it is not overlapping at all (when splitting,
+   *   we can already incorporate the attributes)
+   *   -- better: for each item, go left to right and add own attributes to overlapping items.
+   *   Split them if necessary. After split, i must insert the retainer at a valid position.
+   * - merge items if neighbor has same attributes
+   */
+  for (let i = 0; i < ids.length - 1;) {
+    const range = ids[i]
+    const nextRange = ids[i + 1]
+    // find out how to split range. it must match with next range.
+    // 1) we have space. Split if necessary.
+    // 2) concat attributes in range to the next range. Split range and splice the remainder at
+    // the correct position.
+    if (range.clock < nextRange.clock) { // might need to split range
+      if (range.clock + range.len > nextRange.clock) {
+        // is overlapping
+        const diff = nextRange.clock - range.clock
+        ids[i] = new AttrRange(range.clock, diff, range.attrs)
+        ids.splice(i + 1, 0, new AttrRange(nextRange.clock, range.len - diff, range.attrs))
+      }
+      i++
+      continue
+    }
+    // now we know that range.clock === nextRange.clock
+    // merge range with nextRange
+    const largerRange = range.len > nextRange.len ? range : nextRange
+    const smallerLen = range.len < nextRange.len ? range.len : nextRange.len
+    ids[i] = new AttrRange(range.clock, smallerLen, idmapAttrRangeJoin(range.attrs, nextRange.attrs))
+    if (range.len === nextRange.len) {
+      ids.splice(i + 1, 1)
+    } else {
+      ids[i + 1] = new AttrRange(range.clock + smallerLen, largerRange.len - smallerLen, largerRange.attrs)
+      array.bubblesortItem(ids, i + 1, (a, b) => a.clock - b.clock)
+    }
+    if (smallerLen === 0) i++
+  }
+  while (ids.length > 0 && ids[0].len === 0) {
+    ids.splice(0, 1)
+  }
+  // merge items without filtering or splicing the array.
+  // i is the current pointer
+  // j refers to the current insert position for the pointed item
+  // try to merge dels[i] into dels[j-1] or set dels[j]=dels[i]
+  let i, j
+  for (i = 1, j = 1; i < ids.length; i++) {
+    const left = ids[j - 1]
+    const right = ids[i]
+    if (left.clock + left.len === right.clock && idmapAttrsEqual(left.attrs, right.attrs)) {
+      ids[j - 1] = new AttrRange(left.clock, left.len + right.len, left.attrs)
+    } else if (right.len !== 0) {
+      if (j < i) {
+        ids[j] = right
+      }
+      j++
+    }
+  }
+  ids.length = ids.length === 0 ? 0 : (ids[j - 1].len === 0 ? j - 1 : j)
+}
+
+/**
  * Whenever this is instantiated, it must receive a fresh array of ops, not something copied.
  *
  * @template Attrs
@@ -1169,75 +1396,7 @@ export class AttrRanges {
     const ids = this._ids
     if (!this.sorted) {
       this.sorted = true
-      ids.sort((a, b) => a.clock - b.clock)
-      /**
-       * algorithm thoughts:
-       * - sort (by clock AND by length), bigger length is to the right (or not, we can't make
-       *   assumptions abouth length after long length has been split)
-       * -- maybe better: sort by clock+length. Then split items from right to left. This way, items are always
-       *   in the right order. But I also need to swap if left items is smaller after split
-       *   --- thought: there is no way to go around swapping. Unless, for each item from left to
-       *   right, when I have to split because one of the look-ahead items is overlapping, i split
-       *   it and merge the attributes into the following ones (that I also need to split). Best is
-       *   probably left to right with lookahead.
-       * - left to right, split overlapping items so that we can make the assumption that either an
-       *   item is overlapping with the next 1-on-1 or it is not overlapping at all (when splitting,
-       *   we can already incorporate the attributes)
-       *   -- better: for each item, go left to right and add own attributes to overlapping items.
-       *   Split them if necessary. After split, i must insert the retainer at a valid position.
-       * - merge items if neighbor has same attributes
-       */
-      for (let i = 0; i < ids.length - 1;) {
-        const range = ids[i]
-        const nextRange = ids[i + 1]
-        // find out how to split range. it must match with next range.
-        // 1) we have space. Split if necessary.
-        // 2) concat attributes in range to the next range. Split range and splice the remainder at
-        // the correct position.
-        if (range.clock < nextRange.clock) { // might need to split range
-          if (range.clock + range.len > nextRange.clock) {
-            // is overlapping
-            const diff = nextRange.clock - range.clock
-            ids[i] = new AttrRange(range.clock, diff, range.attrs)
-            ids.splice(i + 1, 0, new AttrRange(nextRange.clock, range.len - diff, range.attrs))
-          }
-          i++
-          continue
-        }
-        // now we know that range.clock === nextRange.clock
-        // merge range with nextRange
-        const largerRange = range.len > nextRange.len ? range : nextRange
-        const smallerLen = range.len < nextRange.len ? range.len : nextRange.len
-        ids[i] = new AttrRange(range.clock, smallerLen, idmapAttrRangeJoin(range.attrs, nextRange.attrs))
-        if (range.len === nextRange.len) {
-          ids.splice(i + 1, 1)
-        } else {
-          ids[i + 1] = new AttrRange(range.clock + smallerLen, largerRange.len - smallerLen, largerRange.attrs)
-          array.bubblesortItem(ids, i + 1, (a, b) => a.clock - b.clock)
-        }
-        if (smallerLen === 0) i++
-      }
-      while (ids.length > 0 && ids[0].len === 0) {
-        ids.splice(0, 1)
-      }
-      // merge items without filtering or splicing the array.
-      // i is the current pointer
-      // j refers to the current insert position for the pointed item
-      // try to merge dels[i] into dels[j-1] or set dels[j]=dels[i]
-      let i, j
-      for (i = 1, j = 1; i < ids.length; i++) {
-        const left = ids[j - 1]
-        const right = ids[i]
-        if (left.clock + left.len === right.clock && idmapAttrsEqual(left.attrs, right.attrs)) {
-          ids[j - 1] = new AttrRange(left.clock, left.len + right.len, left.attrs)
-        } else if (right.len !== 0) {
-          if (j < i) {
-            ids[j] = right
-          }
-          j++
-        }
-      }
-      ids.length = ids.length === 0 ? 0 : (ids[j - 1].len === 0 ? j - 1 : j)
+      sortAndMergeAttrRanges(ids)
     }
     return ids
   }
@@ -1427,9 +1586,11 @@ export class IdMap {
   add (client, clock, len, attrs) {
     if (len === 0) return
     attrs = _ensureAttrs(this, attrs)
-    const ranges = this.clients.get(client)
+    const ranges = /** @type {AttrRanges<Attrs> | IdRanges | undefined} */ (/** @type {unknown} */ (this.clients.get(client)))
     if (ranges == null) {
       this.clients.set(client, new AttrRanges([new AttrRange(clock, len, attrs)]))
+    } else if (ranges instanceof IdRanges) {
+      ranges.addAttrRange(clock, len, attrs)
     } else {
       ranges.add(clock, len, attrs)
     }
@@ -1488,11 +1649,7 @@ export const mergeIdMaps = ams => {
             array.appendTo(ids, nextIds.getIds())
           }
         }
-        ids = ids.map(id => new AttrRange(id.clock, id.len, id.attrs.map(attr =>
-          map.setIfUndefined(attrMapper, attr, () =>
-            _ensureAttrs(merged, [attr])[0]
-          )
-        )))
+        ids = ids.map(id => new AttrRange(id.clock, id.len, mapAttrsWithCache(merged, attrMapper, id.attrs)))
         merged.clients.set(client, new AttrRanges(ids))
       }
     })
@@ -1671,6 +1828,10 @@ export const readIdMap = decoder => {
         if (attrsLen > restDecoder.arr.length - restDecoder.pos) {
           throw error.create('Unexpected end of array')
         }
+        /**
+         * @type {Set<ContentAttribute<any>> | null}
+         */
+        const seenAttrs = attrsLen > 16 ? new Set() : null
         for (let j = 0; j < attrsLen; j++) {
           const attrId = decoding.readVarUint(restDecoder)
           if (attrId > visitedAttributions.length) {
@@ -1685,19 +1846,25 @@ export const readIdMap = decoder => {
             if (attrNameId === visitedAttrNames.length) {
               visitedAttrNames.push(decoding.readVarString(restDecoder))
             }
-            visitedAttributions.push(new ContentAttribute(visitedAttrNames[attrNameId], readSafeAny(restDecoder)))
+            const rawAttr = new ContentAttribute(visitedAttrNames[attrNameId], readSafeAny(restDecoder))
+            const canonicalAttr = _ensureAttrs(idmap, [rawAttr])[0]
+            visitedAttributions.push(canonicalAttr)
           }
-          attrs.push(visitedAttributions[attrId])
+          const attr = visitedAttributions[attrId]
+          if (seenAttrs !== null) {
+            if (!seenAttrs.has(attr)) {
+              seenAttrs.add(attr)
+              attrs.push(attr)
+            }
+          } else if (!idmapAttrsHas(attrs, attr)) {
+            attrs.push(attr)
+          }
         }
         attrRanges.push(new AttrRange(rangeClock, rangeLen, attrs))
       }
       idmap.clients.set(client, new AttrRanges(attrRanges))
     }
   }
-  visitedAttributions.forEach(attr => {
-    idmap.attrs.add(attr)
-    idmap.attrsH.set(attr.hash(), attr)
-  })
   return idmap
 }
 
@@ -1708,18 +1875,80 @@ export const readIdMap = decoder => {
 export const decodeIdMap = data => readIdMap(new IdSetDecoderV2(decoding.createDecoder(data)))
 
 /**
+ * Intern attributes into `idmap` (`attrs` / `attrsH`) and deduplicate.
+ * Uses linear scan for small arrays (`<= 16`) and a `Set` for larger arrays to prevent O(N^2) DoS.
+ *
  * @template Attrs
  * @param {IdMap<Attrs>} idmap
  * @param {Array<ContentAttribute<Attrs>>} attrs
  * @return {Array<ContentAttribute<Attrs>>}
  */
-const _ensureAttrs = (idmap, attrs) => attrs.map(attr =>
-  idmap.attrs.has(attr)
-    ? attr
-    : map.setIfUndefined(idmap.attrsH, attr.hash(), () => {
-      idmap.attrs.add(attr)
-      return attr
-    }))
+const _ensureAttrs = (idmap, attrs) => {
+  const len = attrs.length
+  if (len === 0) return []
+  /**
+   * @type {Array<ContentAttribute<Attrs>>}
+   */
+  const res = []
+  /**
+   * @type {Set<ContentAttribute<Attrs>> | null}
+   */
+  const seen = len > 16 ? new Set() : null
+  for (let i = 0; i < len; i++) {
+    const attr = attrs[i]
+    const interned = idmap.attrs.has(attr)
+      ? attr
+      : map.setIfUndefined(idmap.attrsH, attr.hash(), () => {
+        idmap.attrs.add(attr)
+        return attr
+      })
+    if (seen !== null) {
+      if (!seen.has(interned)) {
+        seen.add(interned)
+        res.push(interned)
+      }
+    } else if (!idmapAttrsHas(res, interned)) {
+      res.push(interned)
+    }
+  }
+  return res
+}
+
+/**
+ * Map and deduplicate `attrs` into `dest` using a per-operation `attrMapper` cache so repeated
+ * attribute objects are only hashed once across ranges.
+ *
+ * @template Attrs
+ * @param {IdMap<Attrs>} dest
+ * @param {Map<ContentAttribute<any>, ContentAttribute<Attrs>>} attrMapper
+ * @param {Array<ContentAttribute<any>>} attrs
+ * @return {Array<ContentAttribute<Attrs>>}
+ */
+const mapAttrsWithCache = (dest, attrMapper, attrs) => {
+  const len = attrs.length
+  if (len === 0) return []
+  /**
+   * @type {Array<ContentAttribute<Attrs>>}
+   */
+  const res = []
+  /**
+   * @type {Set<ContentAttribute<Attrs>> | null}
+   */
+  const seen = len > 16 ? new Set() : null
+  for (let i = 0; i < len; i++) {
+    const attr = attrs[i]
+    const interned = map.setIfUndefined(attrMapper, attr, () => _ensureAttrs(dest, [attr])[0])
+    if (seen !== null) {
+      if (!seen.has(interned)) {
+        seen.add(interned)
+        res.push(interned)
+      }
+    } else if (!idmapAttrsHas(res, interned)) {
+      res.push(interned)
+    }
+  }
+  return res
+}
 
 export const createIdMap = () => new IdMap()
 
@@ -1729,10 +1958,6 @@ export const createIdMap = () => new IdMap()
  *
  * @todo this should be called "excludeIdMap"
  *
- * @todo the `instanceof IdSet` dispatch this relies on lives in `_diffSet` - see the `$idMapAny`
- * note there. Separately, the `attrs`/`attrsH` aliasing below leaves a *stale* index on an emptied
- * result. {@link $idMap} is unaffected: it reads the ranges, which are authoritative.
- *
  * @template {IdMap<any>} ISet
  * @param {ISet} set
  * @param {IdSet | IdMap<any>} exclude
@@ -1740,8 +1965,19 @@ export const createIdMap = () => new IdMap()
  */
 export const diffIdMap = (set, exclude) => {
   const diffed = _diffSet(set, exclude)
-  diffed.attrs = set.attrs
-  diffed.attrsH = set.attrsH
+  /**
+   * @type {Map<ContentAttribute<any>, ContentAttribute<any>>}
+   */
+  const attrMapper = new Map()
+  diffed.clients.forEach(ranges => {
+    const ids = ranges.getIds()
+    for (let i = 0; i < ids.length; i++) {
+      const r = ids[i]
+      if (r.attrs.length > 0) {
+        ids[i] = new AttrRange(r.clock, r.len, mapAttrsWithCache(diffed, attrMapper, r.attrs))
+      }
+    }
+  })
   return diffed
 }
 
@@ -1765,12 +2001,8 @@ export const filterIdMap = (idmap, predicate) => {
     const attrRanges = []
     ranges.getIds().forEach((range) => {
       if (predicate(range.attrs)) {
-        const rangeCpy = range.copyWith(range.clock, range.len)
-        attrRanges.push(rangeCpy)
-        rangeCpy.attrs.forEach(attr => {
-          filtered.attrs.add(attr)
-          filtered.attrsH.set(attr.hash(), attr)
-        })
+        const mappedAttrs = range.attrs.length > 0 ? _ensureAttrs(filtered, range.attrs) : []
+        attrRanges.push(new AttrRange(range.clock, range.len, mappedAttrs))
       }
     })
     if (attrRanges.length > 0) {
