@@ -105,6 +105,10 @@ export class AttributionsRenderer extends ObservableV2 {
      * @type {IdSet?}
      */
     this.rendered = renderedContent === null ? null : mergeIdSets([renderedContent, this.attributed])
+    /**
+     * @type {boolean}
+     */
+    this._clearsInsertOnDelete = true
   }
 
   get $type () { return $renderer }
@@ -507,6 +511,10 @@ export class DiffRenderer extends ObservableV2 {
     this.suggestionOrigins = null
     this._destroyHandler = nextDoc.on('destroy', this.destroy.bind(this))
     prevDoc.on('destroy', this._destroyHandler)
+    /**
+     * @type {boolean}
+     */
+    this._clearsInsertOnDelete = false
   }
 
   get $type () { return $renderer }

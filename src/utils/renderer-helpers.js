@@ -84,6 +84,14 @@ export class AbstractRenderer extends ObservableV2 {
      * @type {IdSet}
      */
     this.attributed = createIdSet()
+    /**
+     * Whether retaining a deleted item under this renderer must clear prior `insert` / `insertAt`
+     * attribution keys from a cached delta. `AttributionsRenderer` transitions deleted items from
+     * `insert` to `delete` attribution, whereas `DiffRenderer` preserves `insert` on deleted items.
+     *
+     * @type {boolean}
+     */
+    this._clearsInsertOnDelete = false
   }
 
   /**

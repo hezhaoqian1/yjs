@@ -1212,7 +1212,12 @@ export class YNode extends ObservableV2 {
                 usingChangedFormats = true
                 // change render: a retained item with no attribution means its attribution was
                 // removed → emit a clear rather than `{}` (skip). Present attribution merges.
-                d.retain(/** @type {ContentString} */ (c.content).str.length, undefined, attribution ?? clearedOwnAttribution())
+                // Under renderers that replace `insert` attribution with `delete` upon deletion
+                // (e.g. `AttributionsRenderer`), explicitly clear stale `insert`/`insertAt` keys.
+                const retainAttribution = (c.deleted && attribution != null && renderer !== null && renderer._clearsInsertOnDelete)
+                  ? /** @type {Attribution} */ (/** @type {unknown} */ (object.assign({ insert: null, insertAt: null }, attribution)))
+                  : attribution
+                d.retain(/** @type {ContentString} */ (c.content).str.length, undefined, retainAttribution ?? clearedOwnAttribution())
               } else {
                 d.useFormats(currentFormats)
                 usingCurrentFormats = true
@@ -1237,16 +1242,19 @@ export class YNode extends ObservableV2 {
                 // a retain expresses the format *diff* → use `changedFormats` (see ContentString)
                 d.useFormats(changedFormats)
                 usingChangedFormats = true
+                const retainAttribution = (c.deleted && attribution != null && renderer !== null && renderer._clearsInsertOnDelete)
+                  ? /** @type {Attribution} */ (/** @type {unknown} */ (object.assign({ insert: null, insertAt: null }, attribution)))
+                  : attribution
                 if (c.deleted && c.content.constructor === ContentType) {
                   // @todo use current transaction instead
-                  d.modify(/** @type {any} */ (c.content).type.toDelta(optsAll), undefined, attribution ?? null)
+                  d.modify(/** @type {any} */ (c.content).type.toDelta(optsAll), undefined, retainAttribution ?? null)
                 } else if (c.content.constructor === ContentType && modified?.has(/** @type {ContentType} */ (c.content).type)) {
                   // a de/re-attributed node the renderer still claims (e.g. a partial accept):
                   // merge/clear its own attribution and descend so the nested walk heals exactly
                   // the child ids in `itemsToRender` — other children keep their attribution
-                  d.modify(/** @type {any} */ (c.content).type.toDelta(optsAll), undefined, attribution ?? clearedOwnAttribution())
+                  d.modify(/** @type {any} */ (c.content).type.toDelta(optsAll), undefined, retainAttribution ?? clearedOwnAttribution())
                 } else {
-                  d.retain(c.content.getLength(), undefined, attribution ?? clearedOwnAttribution())
+                  d.retain(c.content.getLength(), undefined, retainAttribution ?? clearedOwnAttribution())
                 }
               } else if (deep && c.content.constructor === ContentType) {
                 d.useFormats(currentFormats)
