@@ -10,6 +10,7 @@ import * as promise from 'lib0/promise'
 
 import { StructStore } from './StructStore.js'
 import { transact, generateNewClientId } from './Transaction.js'
+import { ContentDoc } from '../structs/Item.js'
 import { YNode } from '../ynode.js'
 import { $doc } from './schemas.js'
 
@@ -149,11 +150,16 @@ export class Doc extends ObservableV2 {
   load () {
     const item = this._item
     if (item !== null && !this.shouldLoad) {
-      transact(/** @type {any} */ (item.parent).doc, transaction => {
-        transaction.subdocsLoaded.add(this)
-      }, null, true)
+      this.shouldLoad = true
+      const parentDoc = item.parent instanceof YNode ? item.parent.doc : null
+      if (parentDoc !== null && !parentDoc.isDestroyed) {
+        transact(parentDoc, transaction => {
+          transaction.subdocsLoaded.add(this)
+        }, null, true)
+      }
+    } else {
+      this.shouldLoad = true
     }
-    this.shouldLoad = true
   }
 
   getSubdocs () {
@@ -230,22 +236,26 @@ export class Doc extends ObservableV2 {
     // unsubscribe). Only top-level types are destroyed here; nested child types are not recursed.
     this.share.forEach(type => type.destroy())
     array.from(this.subdocs).forEach(subdoc => subdoc.destroy())
+    this.subdocs.clear()
     const item = this._item
     if (item !== null) {
       this._item = null
-      const content = /** @type {ContentDoc} */ (item.content)
-      /**
-       * new content doc which replaces the new one
-       */
-      const contentDoc = new Doc({ guid: this.guid, ...content.opts, shouldLoad: false })
-      content.doc = contentDoc
-      contentDoc._item = item
-      transact(/** @type {any} */ (item).parent.doc, transaction => {
-        if (!item.deleted) {
+      const parentDoc = item.parent instanceof YNode ? item.parent.doc : null
+      if (!item.deleted && parentDoc !== null && !parentDoc.isDestroyed && item.content instanceof ContentDoc) {
+        const content = item.content
+        /**
+         * new content doc which replaces the destroyed one
+         */
+        const contentDoc = new Doc({ guid: this.guid, ...content.opts, shouldLoad: false })
+        content.doc = contentDoc
+        contentDoc._item = item
+        transact(parentDoc, transaction => {
           transaction.subdocsAdded.add(contentDoc)
-        }
-        transaction.subdocsRemoved.add(this)
-      }, null, true)
+          transaction.subdocsRemoved.add(this)
+        }, null, true)
+      } else if (item.content instanceof ContentDoc) {
+        item.content.doc = null
+      }
     }
     this.emit('destroy', [this])
     super.destroy()
