@@ -44,11 +44,12 @@ export class Skip extends AbstractStruct {
   /**
    * @param {UpdateEncoderV1 | UpdateEncoderV2} encoder
    * @param {number} offset
+   * @param {number} [offsetEnd=0]
    */
-  write (encoder, offset) {
+  write (encoder, offset, offsetEnd = 0) {
     encoder.writeInfo(structSkipRefNumber)
     // write as VarUint because Skips can't make use of predictable length-encoding
-    encoding.writeVarUint(encoder.restEncoder, this.length - offset)
+    encoding.writeVarUint(encoder.restEncoder, this.length - offset - offsetEnd)
   }
 
   /**
