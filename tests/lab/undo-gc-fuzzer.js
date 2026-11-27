@@ -411,6 +411,21 @@ const assertLawEquivalence = (docs, label) => {
 }
 
 /**
+ * Create a Doc with local post-transaction formatting cleanup disabled so
+ * pure CRDT applyUpdate/mergeUpdates algebraic laws (commutativity, associativity,
+ * idempotency) are tested without unexchanged local cleanup DeleteSet side effects.
+ * (The main multi-peer simulation loop still runs with default cleanupFormatting=true.)
+ *
+ * @param {boolean} gc
+ * @return {Y.Doc}
+ */
+const createPureLawDoc = gc => {
+  const d = new Y.Doc({ gc })
+  d.cleanupFormatting = false
+  return d
+}
+
+/**
  * Verify CRDT algebraic laws (Commutativity, Associativity, Idempotency) on
  * a triple of live diverged updates (both V1 and V2 formats).
  *
@@ -427,13 +442,13 @@ const verifyAlgebraicLawsOnTriple = ({ uA, uB, uC, format, gc, label }) => {
   const apply = format === 'v1' ? Y.applyUpdate : Y.applyUpdateV2
   const merge = format === 'v1' ? Y.mergeUpdates : Y.mergeUpdatesV2
 
-  const docAB = new Y.Doc({ gc })
-  const docBA = new Y.Doc({ gc })
-  const docLeft = new Y.Doc({ gc })
-  const docRight = new Y.Doc({ gc })
-  const docOnce = new Y.Doc({ gc })
-  const docTwice = new Y.Doc({ gc })
-  const docDupMerge = new Y.Doc({ gc })
+  const docAB = createPureLawDoc(gc)
+  const docBA = createPureLawDoc(gc)
+  const docLeft = createPureLawDoc(gc)
+  const docRight = createPureLawDoc(gc)
+  const docOnce = createPureLawDoc(gc)
+  const docTwice = createPureLawDoc(gc)
+  const docDupMerge = createPureLawDoc(gc)
 
   try {
     // 1. Commutativity: apply(uA); apply(uB) === apply(uB); apply(uA)
@@ -486,12 +501,12 @@ const verifyIncrementalTripleLaws = (updates, format, gen, gc, label) => {
   const merge = format === 'v1' ? Y.mergeUpdates : Y.mergeUpdatesV2
 
   // Associativity on raw incremental updates (may contain Skips / pendingStructs)
-  const docL = new Y.Doc({ gc })
-  const docR = new Y.Doc({ gc })
-  const docAB = new Y.Doc({ gc })
-  const docBA = new Y.Doc({ gc })
-  const docIdem1 = new Y.Doc({ gc })
-  const docIdem2 = new Y.Doc({ gc })
+  const docL = createPureLawDoc(gc)
+  const docR = createPureLawDoc(gc)
+  const docAB = createPureLawDoc(gc)
+  const docBA = createPureLawDoc(gc)
+  const docIdem1 = createPureLawDoc(gc)
+  const docIdem2 = createPureLawDoc(gc)
   try {
     apply(docL, merge([merge([uA, uB]), uC]))
     apply(docR, merge([uA, merge([uB, uC])]))
