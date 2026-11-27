@@ -3,7 +3,7 @@ import { writeStructsFromIdSet } from '../../src/utils/encoding-helpers.js'
 import * as encoding from 'lib0/encoding'
 import * as delta from 'lib0/delta'
 import * as dpos from 'lib0/delta/position'
-import { assertInvariant, equalBytes, InvariantError, verifyDocInvariants } from './invariants.js'
+import { assertInvariant, deepEqualValues, equalBytes, InvariantError, verifyDocInvariants } from './invariants.js'
 
 /**
  * @typedef {{
@@ -1874,6 +1874,48 @@ export const REPRODUCERS = [
         attrsB1.some(x => x.val === 'bob'),
         `BUG-IDMAP-ADD-DUP(B): decodeIdMap silently erased 'bob' on [5,10) (vals=${attrsB1 ? attrsB1.map(x => x.val).join(',') : 'null'})`
       )
+    }
+  },
+  {
+    id: 'BUG-ATTR-DELETED-FORMAT-CLEAR',
+    title: 'Deleting an unattributed ContentFormat marker under AttributionsRenderer mis-clears/corrupts live .delta cache attribution',
+    targetPr: 'PR #5',
+    run: () => {
+      const doc = new Y.Doc({ gc: false })
+      const text = doc.get('text')
+      doc.clientID = 1 // attributed author
+      text.insert(0, 'ABXYZ', { bold: true, color: 'red' })
+      doc.clientID = 2 // unattributed author
+      text.format(1, 4, { color: null }) // closes prevUnattr['color'] while 'bold' holds d.usedAttribution open
+      text.format(2, 1, { color: 'blue' }) // unattributed CF(color:'blue') before 'X' + CF(color:null) after 'X'
+
+      const cids = Y.createContentIdsFromDoc(doc, false)
+      const cmap = Y.createContentMap()
+      const c1Ranges = cids.inserts.clients.get(1)
+      if (c1Ranges !== undefined) {
+        const ids = c1Ranges.getIds()
+        for (let i = 0; i < ids.length; i++) {
+          cmap.inserts.add(1, ids[i].clock, ids[i].len, [Y.createContentAttribute('insert', 'u0')])
+        }
+      }
+      const rend = Y.createAttributionsRenderer(cmap)
+      try {
+        text.useRenderer(rend)
+        const live = text.delta // materialize cache; 'YZ' has { bold: ['u0'], color: ['u0'] }
+        text.delete(1, 2) // deletes 'BX' -> cleanupFormattingGap deletes unattributed CF(color:'blue')!
+
+        const fresh = text.toDeltaDeep()
+        const liveJson = live.toJSON()
+        const freshJson = fresh.toJSON()
+        const cmp = deepEqualValues(liveJson, freshJson, 'BUG-ATTR-DELETED-FORMAT-CLEAR')
+        assertInvariant(
+          live.equals(fresh) && cmp.equal,
+          `BUG-ATTR-DELETED-FORMAT-CLEAR: live .delta drifted from toDeltaDeep() after deleting unattributed ContentFormat (${cmp.reason ?? 'equals=false'})\n  live:  ${JSON.stringify(liveJson)}\n  fresh: ${JSON.stringify(freshJson)}`
+        )
+      } finally {
+        rend.destroy()
+        doc.destroy()
+      }
     }
   }
 ]
