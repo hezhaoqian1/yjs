@@ -1,17 +1,26 @@
 import * as time from 'lib0/time'
 import * as array from 'lib0/array'
 import * as logging from 'lib0/logging'
+import * as math from 'lib0/math'
 import { ObservableV2 } from 'lib0/observable'
 
 import { mergeIdSets, iterateStructsByIdSet, diffIdSet } from './ids.js'
-import { Item, followRedone } from '../structs/Item.js'
+import { Item, ContentType } from '../structs/Item.js'
 
 import { transact } from './Transaction.js'
 import { createID } from './ID.js'
 import { isParentOf } from './isParentOf.js'
 import { getItemCleanStart } from './transaction-helpers.js'
 import { Doc } from './Doc.js'
-import { YNode } from '../ynode.js'
+import { YNode, clearSearchMarkers } from '../ynode.js'
+
+/**
+ * Registry of active UndoManagers per Doc so clearing or destroying one stack/UndoManager
+ * never strips `keep = true` from items or ancestors still needed by another stack or UndoManager.
+ *
+ * @type {WeakMap<Doc, Set<UndoManager>>}
+ */
+const docUndoManagers = new WeakMap()
 
 export class StackItem {
   /**
@@ -27,17 +36,100 @@ export class StackItem {
     this.meta = new Map()
   }
 }
+
+/**
+ * @param {Transaction} tr
+ * @param {UndoManager} um
+ * @param {StackItem} stackItem
+ * @param {boolean} keep
+ */
+const setStackItemKeep = (tr, um, stackItem, keep) => {
+  iterateStructsByIdSet(tr, stackItem.deletes, item => {
+    if (item instanceof Item && um.scope.some(type => type === tr.doc || isParentOf(/** @type {YNode} */ (type), item))) {
+      keepItem(item, keep)
+    }
+  })
+}
+
 /**
  * @param {Transaction} tr
  * @param {UndoManager} um
  * @param {StackItem} stackItem
  */
 const clearUndoManagerStackItem = (tr, um, stackItem) => {
-  iterateStructsByIdSet(tr, stackItem.deletes, item => {
-    if (item instanceof Item && um.scope.some(type => type === tr.doc || isParentOf(/** @type {YNode} */ (type), item))) {
-      keepItem(item, false)
+  setStackItemKeep(tr, um, stackItem, false)
+}
+
+/**
+ * Re-apply `keep = true` for every remaining stack item across all active UndoManagers on `doc`.
+ *
+ * @param {Transaction} tr
+ * @param {Doc} doc
+ */
+const rekeepDocUndoManagers = (tr, doc) => {
+  const ums = docUndoManagers.get(doc)
+  if (ums !== undefined) {
+    ums.forEach(um => {
+      for (let i = 0; i < um.undoStack.length; i++) {
+        setStackItemKeep(tr, um, um.undoStack[i], true)
+      }
+      for (let i = 0; i < um.redoStack.length; i++) {
+        setStackItemKeep(tr, um, um.redoStack[i], true)
+      }
+    })
+  }
+}
+
+/**
+ * Follow a chain of `redone` pointers starting at `id` while clamping the covered span
+ * against every hop's remaining length (so neither intermediate splits nor downstream merges
+ * can widen the resolved range).
+ *
+ * @param {StructStore} store
+ * @param {ID} id
+ * @param {number} maxLen
+ * @return {{ item: Item | GC | Skip, diff: number, len: number }}
+ */
+const followRedoneRange = (store, id, maxLen) => {
+  /**
+   * @type {ID|null}
+   */
+  let nextID = id
+  let diff = 0
+  let len = maxLen
+  /**
+   * @type {Item | GC | Skip}
+   */
+  let item
+  do {
+    if (diff > 0) {
+      nextID = createID(nextID.client, nextID.clock + diff)
     }
-  })
+    item = store.get(nextID)
+    diff = nextID.clock - item.id.clock
+    len = math.min(len, item.length - diff)
+    nextID = item.isItem ? /** @type {Item} */ (item).redone : null
+  } while (nextID !== null)
+  return {
+    item, diff, len
+  }
+}
+
+/**
+ * @param {Transaction} transaction
+ * @param {ID} id
+ * @return {Item|null}
+ */
+const getRedoneItem = (transaction, id) => {
+  const store = transaction.doc.store
+  if (id.clock >= store.getClock(id.client)) {
+    return null
+  }
+  const struct = store.get(id)
+  if (!struct.isItem) {
+    return null
+  }
+  return getItemCleanStart(transaction, id)
 }
 
 /**
@@ -70,13 +162,27 @@ const popStackItem = (undoManager, stack, eventType) => {
       iterateStructsByIdSet(transaction, stackItem.inserts, struct => {
         if (struct instanceof Item) {
           if (struct.redone !== null) {
-            let { item, diff } = followRedone(store, struct.id)
-            if (diff > 0) {
-              item = getItemCleanStart(transaction, createID(item.id.client, item.id.clock + diff))
+            const origClient = struct.id.client
+            const origClock = struct.id.clock
+            const origLen = struct.length
+            let offset = 0
+            while (offset < origLen) {
+              const { item, diff, len } = followRedoneRange(store, createID(origClient, origClock + offset), origLen - offset)
+              if (item.isItem && !item.deleted) {
+                let target = /** @type {Item} */ (item)
+                if (diff > 0) {
+                  target = getItemCleanStart(transaction, createID(target.id.client, target.id.clock + diff))
+                }
+                if (len < target.length) {
+                  getItemCleanStart(transaction, createID(target.id.client, target.id.clock + len))
+                }
+                if (scope.some(type => type === transaction.doc || isParentOf(/** @type {YNode} */ (type), target))) {
+                  itemsToDelete.push(target)
+                }
+              }
+              offset += len
             }
-            struct = item
-          }
-          if (!struct.deleted && scope.some(type => type === transaction.doc || isParentOf(/** @type {YNode} */ (type), /** @type {Item} */ (struct)))) {
+          } else if (!struct.deleted && scope.some(type => type === transaction.doc || isParentOf(/** @type {YNode} */ (type), struct))) {
             itemsToDelete.push(struct)
           }
         }
@@ -103,12 +209,14 @@ const popStackItem = (undoManager, stack, eventType) => {
           performedChange = true
         }
       }
+      clearUndoManagerStackItem(transaction, undoManager, stackItem)
+      rekeepDocUndoManagers(transaction, doc)
       undoManager.currStackItem = performedChange ? stackItem : null
     }
     transaction.changed.forEach((subProps, type) => {
       // destroy search marker if necessary
       if (subProps.has(null) && type._searchMarker) {
-        type._searchMarker.length = 0
+        clearSearchMarkers(type._searchMarker)
       }
     })
     _tr = transaction
@@ -256,6 +364,12 @@ export class UndoManager extends ObservableV2 {
     this.destroy = this.destroy.bind(this)
     this.doc.on('afterTransaction', this.afterTransactionHandler)
     this.doc.on('destroy', this.destroy)
+    let ums = docUndoManagers.get(this.doc)
+    if (ums === undefined) {
+      ums = new Set()
+      docUndoManagers.set(this.doc, ums)
+    }
+    ums.add(this)
   }
 
   /**
@@ -300,6 +414,7 @@ export class UndoManager extends ObservableV2 {
           this.redoStack.forEach(item => clearUndoManagerStackItem(tr, this, item))
           this.redoStack = []
         }
+        rekeepDocUndoManagers(tr, this.doc)
         this.emit('stack-cleared', [{ undoStackCleared: clearUndoStack, redoStackCleared: clearRedoStack }])
       })
     }
@@ -380,9 +495,28 @@ export class UndoManager extends ObservableV2 {
   }
 
   destroy () {
+    const ums = docUndoManagers.get(this.doc)
+    if (ums !== undefined) {
+      ums.delete(this)
+      if (ums.size === 0) {
+        docUndoManagers.delete(this.doc)
+      }
+    }
     this.trackedOrigins.delete(this)
     this.doc.off('afterTransaction', this.afterTransactionHandler)
     this.doc.off('destroy', this.destroy)
+    if (!this.doc.isDestroyed && (this.undoStack.length > 0 || this.redoStack.length > 0)) {
+      this.doc.transact(tr => {
+        this.undoStack.forEach(item => clearUndoManagerStackItem(tr, this, item))
+        this.redoStack.forEach(item => clearUndoManagerStackItem(tr, this, item))
+        this.undoStack = []
+        this.redoStack = []
+        rekeepDocUndoManagers(tr, this.doc)
+      })
+    } else {
+      this.undoStack = []
+      this.redoStack = []
+    }
     super.destroy()
   }
 }
@@ -398,8 +532,13 @@ export class UndoManager extends ObservableV2 {
  */
 export const undoContentIds = (ydoc, contentIds, opts = {}) => {
   const um = new UndoManager(ydoc, opts)
-  um.undoStack.push(new StackItem(diffIdSet(contentIds.inserts, contentIds.deletes), diffIdSet(contentIds.deletes, contentIds.inserts)))
-  um.undo()
+  try {
+    um.undoStack.push(new StackItem(diffIdSet(contentIds.inserts, contentIds.deletes), diffIdSet(contentIds.deletes, contentIds.inserts)))
+    um.undo()
+  } finally {
+    um.clear()
+    um.destroy()
+  }
 }
 
 /**
@@ -428,7 +567,7 @@ export const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemo
   const ownClientID = doc.clientID
   const redone = item.redone
   if (redone !== null) {
-    return getItemCleanStart(transaction, redone)
+    return getRedoneItem(transaction, redone)
   }
   let parentItem = /** @type {YNode} */ (item.parent)._item
   /**
@@ -446,7 +585,14 @@ export const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemo
       return null
     }
     while (parentItem.redone !== null) {
-      parentItem = getItemCleanStart(transaction, parentItem.redone)
+      const nextParent = getRedoneItem(transaction, parentItem.redone)
+      if (nextParent === null) {
+        return null
+      }
+      parentItem = nextParent
+    }
+    if (parentItem.deleted || !(parentItem.content instanceof ContentType)) {
+      return null
     }
   }
   /**
@@ -466,7 +612,7 @@ export const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemo
       let leftTrace = left
       // trace redone until parent matches
       while (leftTrace !== null && /** @type {YNode} */ (leftTrace.parent)._item !== parentItem) {
-        leftTrace = leftTrace.redone === null ? null : getItemCleanStart(transaction, leftTrace.redone)
+        leftTrace = leftTrace.redone === null ? null : getRedoneItem(transaction, leftTrace.redone)
       }
       if (leftTrace !== null && /** @type {YNode} */ (leftTrace.parent)._item === parentItem) {
         left = leftTrace
@@ -481,7 +627,7 @@ export const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemo
       let rightTrace = right
       // trace redone until parent matches
       while (rightTrace !== null && /** @type {YNode} */ (rightTrace.parent)._item !== parentItem) {
-        rightTrace = rightTrace.redone === null ? null : getItemCleanStart(transaction, rightTrace.redone)
+        rightTrace = rightTrace.redone === null ? null : getRedoneItem(transaction, rightTrace.redone)
       }
       if (rightTrace !== null && /** @type {YNode} */ (rightTrace.parent)._item === parentItem) {
         right = rightTrace
@@ -498,9 +644,11 @@ export const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemo
       while (left !== null && left.right !== null && (left.right.redone || itemsToDelete.hasId(left.right.id) || isDeletedByUndoStack(um.undoStack, left.right.id) || isDeletedByUndoStack(um.redoStack, left.right.id))) {
         left = left.right
         // follow redone
-        while (left.redone) left = getItemCleanStart(transaction, left.redone)
+        while (left !== null && left.redone) {
+          left = getRedoneItem(transaction, left.redone)
+        }
       }
-      if (left && left.right !== null) {
+      if (left === null || left.right !== null) {
         // It is not possible to redo this item because it conflicts with a
         // change from another client
         return null
@@ -523,7 +671,6 @@ export const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemo
     item.content.copy()
   )
   item.redone = nextId
-  keepItem(redoneItem, true)
   redoneItem.integrate(transaction, 0)
   return redoneItem
 }
@@ -538,7 +685,7 @@ export const redoItem = (transaction, item, redoitems, itemsToDelete, ignoreRemo
  * @param {boolean} keep
  */
 export const keepItem = (item, keep) => {
-  while (item !== null && item.keep !== keep) {
+  while (item !== null) {
     item.keep = keep
     item = /** @type {YNode} */ (item.parent)._item
   }

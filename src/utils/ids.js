@@ -108,6 +108,7 @@ export class IdRanges {
     const cpy = new IdRanges(this._ids.slice())
     cpy.sorted = this.sorted
     this._lastIsUsed = true
+    cpy._lastIsUsed = true
     return cpy
   }
 
@@ -463,10 +464,17 @@ export const iterateStructsByIdSet = (transaction, ds, f) =>
   ds.clients.forEach((idRanges, clientid) => {
     const ranges = idRanges.getIds()
     const structs = /** @type {Array<GC|Item>} */ (transaction.doc.store.clients.get(clientid))
-    if (structs != null) {
+    if (structs != null && structs.length > 0) {
+      const firstClock = structs[0].id.clock
+      const lastStruct = structs[structs.length - 1]
+      const nextClock = lastStruct.id.clock + lastStruct.length
       for (let i = 0; i < ranges.length; i++) {
         const del = ranges[i]
-        iterateStructs(transaction, structs, del.clock, del.len, f)
+        const start = math.max(del.clock, firstClock)
+        const end = math.min(del.clock + del.len, nextClock)
+        if (start < end) {
+          iterateStructs(transaction, structs, start, end - start, f)
+        }
       }
     }
   })
@@ -503,13 +511,16 @@ export const iterateStructsByIdSetWithoutSplits = (store, ds, f) =>
   ds.clients.forEach((idRanges, clientid) => {
     const ranges = idRanges.getIds()
     const structs = /** @type {Array<GC|Item>} */ (store.clients.get(clientid))
-    if (structs != null) {
+    if (structs != null && structs.length > 0) {
+      const firstClock = structs[0].id.clock
       const lastStruct = structs[structs.length - 1]
       const nextClock = lastStruct.id.clock + lastStruct.length
       for (let i = 0; i < ranges.length; i++) {
         const del = ranges[i]
-        if (del.clock < nextClock) {
-          iterateStructsWithoutSplits(structs, del.clock, del.len, f)
+        const start = math.max(del.clock, firstClock)
+        const end = math.min(del.clock + del.len, nextClock)
+        if (start < end) {
+          iterateStructsWithoutSplits(structs, start, end - start, f)
         }
       }
     }

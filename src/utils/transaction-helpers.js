@@ -269,18 +269,20 @@ export const tryGcDeleteSet = (tr, ds, gcFilter) => {
   for (const [client, _deleteItems] of ds.clients.entries()) {
     const deleteItems = _deleteItems.getIds()
     const structs = /** @type {Array<Item>} */ (tr.doc.store.clients.get(client))
+    if (structs == null || structs.length === 0) continue
+    const firstClock = structs[0].id.clock
+    const lastStruct = structs[structs.length - 1]
+    const nextClock = lastStruct.id.clock + lastStruct.length
     for (let di = deleteItems.length - 1; di >= 0; di--) {
       const deleteItem = deleteItems[di]
-      const endDeleteItemClock = deleteItem.clock + deleteItem.len
+      const startClock = math.max(deleteItem.clock, firstClock)
+      const endDeleteItemClock = math.min(deleteItem.clock + deleteItem.len, nextClock)
+      if (startClock >= endDeleteItemClock) continue
       for (
-        let si = findIndexSS(structs, deleteItem.clock), struct = structs[si];
+        let si = findIndexSS(structs, startClock), struct = structs[si];
         si < structs.length && struct.id.clock < endDeleteItemClock;
         struct = structs[++si]
       ) {
-        const struct = structs[si]
-        if (deleteItem.clock + deleteItem.len <= struct.id.clock) {
-          break
-        }
         if (struct.isItem && struct.deleted && !(struct).keep && gcFilter(/** @type {Item} */ (struct))) {
           /** @type {Item} */ (struct).gc(tr, false)
         }
@@ -299,13 +301,20 @@ export const tryMerge = (ds, store) => {
   ds.clients.forEach((_deleteItems, client) => {
     const deleteItems = _deleteItems.getIds()
     const structs = /** @type {Array<GC|Item>} */ (store.clients.get(client))
+    if (structs == null || structs.length === 0) return
+    const firstClock = structs[0].id.clock
+    const lastStruct = structs[structs.length - 1]
+    const nextClock = lastStruct.id.clock + lastStruct.length
     for (let di = deleteItems.length - 1; di >= 0; di--) {
       const deleteItem = deleteItems[di]
+      const startClock = math.max(deleteItem.clock, firstClock)
+      const endClock = math.min(deleteItem.clock + deleteItem.len, nextClock)
+      if (startClock >= endClock) continue
       // start with merging the item next to the last deleted item
-      const mostRightIndexToCheck = math.min(structs.length - 1, 1 + findIndexSS(structs, deleteItem.clock + deleteItem.len - 1))
+      const mostRightIndexToCheck = math.min(structs.length - 1, 1 + findIndexSS(structs, endClock - 1))
       for (
         let si = mostRightIndexToCheck, struct = structs[si];
-        si > 0 && struct.id.clock >= deleteItem.clock;
+        si > 0 && struct.id.clock >= startClock;
         struct = structs[si]
       ) {
         si -= 1 + tryToMergeWithLefts(structs, si)

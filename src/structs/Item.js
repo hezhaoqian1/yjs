@@ -333,17 +333,25 @@ export class Item extends AbstractStruct {
       this.content.mergeWith(right.content)
     ) {
       const searchMarker = /** @type {YNode} */ (this.parent)._searchMarker
-      if (searchMarker) {
-        searchMarker.forEach(marker => {
+      if (searchMarker && right.marker) {
+        for (let i = searchMarker.length - 1; i >= 0; i--) {
+          const marker = searchMarker[i]
           if (marker.p === right) {
-            // right is going to be "forgotten" so we need to update the marker
-            marker.p = this
-            // adjust marker index
-            if (!this.deleted && this.countable) {
-              marker.index -= this.length
+            right.marker = false
+            if (this.marker) {
+              // `this` already has a marker; remove duplicate instead of aliasing
+              searchMarker.splice(i, 1)
+            } else {
+              // right is going to be "forgotten" so we need to update the marker
+              marker.p = this
+              this.marker = true
+              // adjust marker index
+              if (!this.deleted && this.countable) {
+                marker.index -= this.length
+              }
             }
           }
-        })
+        }
       }
       if (right.keep) {
         this.keep = true
@@ -384,6 +392,9 @@ export class Item extends AbstractStruct {
   gc (tr, parentGCd) {
     if (!this.deleted) {
       throw error.unexpectedCase()
+    }
+    if (this.keep || (this.content.constructor === ContentType && hasKeptDescendant(/** @type {ContentType} */ (this.content).type))) {
+      return
     }
     this.content.gc(tr)
     if (parentGCd) {
@@ -1151,7 +1162,12 @@ export class ContentFormat {
   integrate (_transaction, item) {
     // @todo searchmarker are currently unsupported for rich text documents
     const p = /** @type {import('../ynode.js').YNode<any>} */ (item.parent)
-    p._searchMarker = null
+    if (p._searchMarker !== null) {
+      for (let i = 0; i < p._searchMarker.length; i++) {
+        p._searchMarker[i].p.marker = false
+      }
+      p._searchMarker = null
+    }
     p._hasFormatting = true
   }
 
@@ -1388,6 +1404,48 @@ export const YXmlHookRefID = 5
 export const YXmlTextRefID = 6
 
 /**
+ * Iteratively check whether any descendant Item inside `rootType` is marked `keep === true`.
+ *
+ * @param {import('../ynode.js').YNode} rootType
+ * @return {boolean}
+ */
+const hasKeptDescendant = rootType => {
+  /**
+   * @type {Array<import('../ynode.js').YNode>}
+   */
+  const stack = [rootType]
+  while (stack.length > 0) {
+    const type = /** @type {import('../ynode.js').YNode} */ (stack.pop())
+    let item = type._start
+    while (item !== null) {
+      if (item.keep) {
+        return true
+      }
+      if (item.content.constructor === ContentType) {
+        stack.push(/** @type {ContentType} */ (item.content).type)
+      }
+      item = item.right
+    }
+    for (const mapHead of type._map.values()) {
+      /**
+       * @type {Item | null}
+       */
+      let mItem = mapHead
+      while (mItem !== null) {
+        if (mItem.keep) {
+          return true
+        }
+        if (mItem.content.constructor === ContentType) {
+          stack.push(/** @type {ContentType} */ (mItem.content).type)
+        }
+        mItem = mItem.left
+      }
+    }
+  }
+  return false
+}
+
+/**
  * @private
  */
 export class ContentType {
@@ -1457,10 +1515,27 @@ export class ContentType {
    * @param {Transaction} transaction
    */
   delete (transaction) {
-    let item = this.type._start
-    while (item !== null) {
+    /**
+     * @type {Array<import('../ynode.js').YNode>}
+     */
+    const stack = [this.type]
+    /**
+     * @param {Item} item
+     */
+    const visitChild = item => {
       if (!item.deleted) {
-        item.delete(transaction)
+        if (item.content.constructor === ContentType) {
+          const parent = /** @type {import('../ynode.js').YNode} */ (item.parent)
+          if (item.countable && item.parentSub === null) {
+            parent._length -= item.length
+          }
+          item.markDeleted()
+          transaction.deleteSet.add(item.id.client, item.id.clock, item.length)
+          addChangedTypeToTransaction(transaction, parent, item.parentSub)
+          stack.push(/** @type {ContentType} */ (item.content).type)
+        } else {
+          item.delete(transaction)
+        }
       } else if (!transaction.insertSet.hasId(item.id)) {
         // This will be gc'd later and we want to merge it if possible
         // We try to merge all deleted items after each transaction,
@@ -1468,35 +1543,56 @@ export class ContentType {
         // since it is not in transaction.ds. Hence we add it to transaction._mergeStructs
         transaction._mergeStructs.push(item)
       }
-      item = item.right
     }
-    this.type._map.forEach(item => {
-      if (!item.deleted) {
-        item.delete(transaction)
-      } else if (!transaction.insertSet.hasId(item.id)) {
-        // same as above
-        transaction._mergeStructs.push(item)
+    while (stack.length > 0) {
+      const type = /** @type {import('../ynode.js').YNode} */ (stack.pop())
+      let item = type._start
+      while (item !== null) {
+        visitChild(item)
+        item = item.right
       }
-    })
+      type._map.forEach(visitChild)
+    }
   }
 
   /**
    * @param {Transaction} tr
    */
   gc (tr) {
-    let item = this.type._start
-    while (item !== null) {
-      item.gc(tr, true)
-      item = item.right
-    }
-    this.type._start = null
-    this.type._map.forEach(/** @param {Item | null} item */ (item) => {
-      while (item !== null) {
-        item.gc(tr, true)
-        item = item.left
+    /**
+     * @type {Array<import('../ynode.js').YNode>}
+     */
+    const stack = [this.type]
+    /**
+     * @param {Item} item
+     */
+    const gcChild = item => {
+      if (!item.deleted) {
+        throw error.unexpectedCase()
       }
-    })
-    this.type._map = new Map()
+      if (item.content.constructor === ContentType) {
+        stack.push(/** @type {ContentType} */ (item.content).type)
+      } else {
+        item.content.gc(tr)
+      }
+      replaceStruct(tr, item, new GC(item.id, item.length))
+    }
+    while (stack.length > 0) {
+      const type = /** @type {import('../ynode.js').YNode} */ (stack.pop())
+      let item = type._start
+      while (item !== null) {
+        gcChild(item)
+        item = item.right
+      }
+      type._start = null
+      type._map.forEach(/** @param {Item | null} mItem */ mItem => {
+        while (mItem !== null) {
+          gcChild(mItem)
+          mItem = mItem.left
+        }
+      })
+      type._map = new Map()
+    }
   }
 
   /**

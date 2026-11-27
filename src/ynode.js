@@ -505,9 +505,12 @@ export const deleteText = (transaction, currPos, length) => {
   if (start) {
     cleanupFormattingGap(transaction, start, currPos.right, startFormats, currPos.currentFormats)
   }
-  const parent = /** @type {YNode<any>} */ (/** @type {Item} */ (currPos.left || currPos.right).parent)
-  if (parent._searchMarker) {
-    updateMarkerChanges(parent._searchMarker, currPos.index, -startLength + length)
+  const anchor = currPos.left || currPos.right
+  if (anchor !== null) {
+    const parent = /** @type {YNode<any>} */ (anchor.parent)
+    if (parent._searchMarker) {
+      updateMarkerChanges(parent._searchMarker, currPos.index, -startLength + length)
+    }
   }
   return currPos
 }
@@ -664,6 +667,18 @@ export const updateMarkerChanges = (searchMarker, index, len) => {
       m.index = math.max(index, m.index + len)
     }
   }
+}
+
+/**
+ * Clear all search markers and reset the marker bit on each referenced Item.
+ *
+ * @param {Array<ArraySearchMarker>} searchMarker
+ */
+export const clearSearchMarkers = searchMarker => {
+  for (let i = 0; i < searchMarker.length; i++) {
+    searchMarker[i].p.marker = false
+  }
+  searchMarker.length = 0
 }
 
 /**
@@ -1009,7 +1024,7 @@ export class YNode extends ObservableV2 {
     // cleanup's `changedParentTypes` loop (see Transaction.js) so it bubbles to ancestors like
     // `observeDeep`, not here where only the directly-changed type is visible.
     if (!transaction.local && this._searchMarker) {
-      this._searchMarker.length = 0
+      clearSearchMarkers(this._searchMarker)
     }
     // If a remote change happened, we try to cleanup potential formatting duplicates.
     if (!transaction.local && this._hasFormatting) {
