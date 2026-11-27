@@ -1,5 +1,6 @@
 import { ObservableV2 } from 'lib0/observable'
 import * as encoding from 'lib0/encoding'
+import * as binary from 'lib0/binary'
 
 import { getItemCleanStart } from './transaction-helpers.js'
 import { diffIdSet, createInsertSetFromStructStore, createDeleteSetFromStructStore, insertIntoIdSet, mergeIdSets, intersectSets, createIdSet, createIdSetFromIdMap, writeIdSet, createIdMapFromIdSet, insertIntoIdMap, diffIdMap, mergeIdMaps, intersectMaps, createMaybeAttrRange } from './ids.js'
@@ -211,10 +212,16 @@ export const createAttributionsRenderer = (attributions, options) => new Attribu
  * @param {number} client
  * @param {number} clock
  * @param {number} len
+ * @return {AbstractContent | null}
  */
 const getItemContent = (store, client, clock, len) => {
-  // Retrieved item is never more fragmented than the newer item.
-  const prevItem = store.getItem(createID(client, clock))
+  if (clock >= store.getClock(client) || store.skips.has(client, clock)) {
+    return null
+  }
+  const prevItem = store.get(createID(client, clock))
+  if (!(prevItem instanceof Item) || prevItem.content instanceof ContentDeleted) {
+    return null
+  }
   const diffStart = clock - prevItem.id.clock
   let content = prevItem.length > 1 ? prevItem.content.copy() : prevItem.content
   // trim itemContent to the correct size.
@@ -309,6 +316,7 @@ const collectSuggestedChanges = (tr, renderer, start, end, collectAll) => {
   // eslint-disable-next-line
   itemLoop: while (item != null) {
     const itemClient = item.id.client
+    const nextRight = item.right
     const slice = (item.deleted ? renderer.deletes : renderer.inserts).slice(itemClient, item.id.clock, item.length)
     foundEndItem ||= item === endItem
     if (item.deleted) {
@@ -324,9 +332,33 @@ const collectSuggestedChanges = (tr, renderer, start, end, collectAll) => {
           }
         }
         if (tr != null) {
-          const splicedItem = getItemCleanStart(tr, createID(itemClient, s.clock))
           if (s.attrs != null) {
-            splicedItem.content = getItemContent(renderer._prevDocStore, itemClient, s.clock, s.len)
+            let cClock = s.clock
+            const endClock = s.clock + s.len
+            while (cClock < endClock) {
+              const splicedItem = getItemCleanStart(tr, createID(itemClient, cClock))
+              const content = getItemContent(renderer._prevDocStore, itemClient, cClock, splicedItem.length)
+              if (content === null) {
+                break
+              }
+              const clen = content.getLength()
+              if (clen <= 0) {
+                break
+              }
+              if (clen < splicedItem.length) {
+                // prevDoc split this item into smaller fragments; split splicedItem to preserve length === content.getLength()
+                getItemCleanStart(tr, createID(itemClient, cClock + clen))
+              }
+              splicedItem.content = content
+              if (content.isCountable()) {
+                splicedItem.info |= binary.BIT2
+              } else {
+                splicedItem.info &= ~binary.BIT2
+              }
+              cClock += clen
+            }
+          } else {
+            getItemCleanStart(tr, createID(itemClient, s.clock))
           }
         }
       }
@@ -352,7 +384,7 @@ const collectSuggestedChanges = (tr, renderer, start, end, collectAll) => {
         }
       }
     }
-    item = item.right
+    item = nextRight
   }
   return { inserts, deletes }
 }
@@ -531,13 +563,14 @@ export class DiffRenderer extends ObservableV2 {
   rejectChanges (start, end = start) {
     this._nextDoc.transact(tr => {
       const { inserts, deletes } = collectSuggestedChanges(tr, this, start, end, false)
-      const encoder = new UpdateEncoderV1()
-      writeStructsFromIdSet(encoder, this._nextDoc.store, inserts)
-      writeIdSet(encoder, deletes)
       const um = new UndoManager(this._nextDoc)
-      um.undoStack.push(new StackItem(inserts, deletes))
-      um.undo()
-      um.destroy()
+      try {
+        um.undoStack.push(new StackItem(inserts, deletes))
+        um.undo()
+      } finally {
+        um.clear()
+        um.destroy()
+      }
     })
     this.acceptChanges(start, end)
   }
