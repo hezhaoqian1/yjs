@@ -135,6 +135,20 @@ export const deepEqualValues = (rawA, rawB, path = '$') => {
 }
 
 /**
+ * Read optional formatting snapshot from an ArraySearchMarker (compatible before & after Perf PR #1).
+ *
+ * @param {object} marker
+ * @return {{ hasProp: boolean, formats: Map<string, unknown> | null | undefined }}
+ */
+const readMarkerFormats = marker => {
+  if ('formats' in marker) {
+    const val = /** @type {{ formats?: Map<string, unknown> | null }} */ (marker).formats
+    return { hasProp: true, formats: val }
+  }
+  return { hasProp: false, formats: undefined }
+}
+
+/**
  * Format an ID or null for diagnostic messages.
  *
  * @param {ID | null} id
@@ -432,9 +446,15 @@ export const verifyDocInvariants = (doc, { expectNoPending = false, label = `doc
   const visitedItems = new Set()
 
   for (const node of nodes) {
-    // 1. Verify _start doubly-linked list, cycle freedom, _length, and search markers
+    // 1. Verify _start doubly-linked list, cycle freedom, _length, and full _searchMarker bijection + formats
     /** @type {Map<Item, number>} */
     const itemOffsets = new Map()
+    /** @type {Set<Item>} */
+    const markedItems = new Set()
+    /** @type {Map<Item, Map<string, unknown>>} */
+    const itemFormats = new Map()
+    /** @type {Map<string, unknown>} */
+    const runningFormats = new Map()
     let liveLength = 0
     if (node._start !== null) {
       assertInvariant(
@@ -464,8 +484,21 @@ export const verifyDocInvariants = (doc, { expectNoPending = false, label = `doc
         )
         itemOffsets.set(curr, liveLength)
         visitedItems.add(curr)
-        if (!curr.deleted && curr.countable) {
-          liveLength += curr.length
+        if (curr.marker) {
+          markedItems.add(curr)
+          itemFormats.set(curr, new Map(runningFormats))
+        }
+        if (!curr.deleted) {
+          if (curr.countable) {
+            liveLength += curr.length
+          }
+          if (curr.content instanceof Y.ContentFormat) {
+            if (curr.content.value === null) {
+              runningFormats.delete(curr.content.key)
+            } else {
+              runningFormats.set(curr.content.key, curr.content.value)
+            }
+          }
         }
         prev = curr
         curr = curr.right
@@ -475,9 +508,20 @@ export const verifyDocInvariants = (doc, { expectNoPending = false, label = `doc
       node._length === liveLength,
       `${label}: node._length=${node._length} !== sum of live countable items (${liveLength})`
     )
+    /** @type {Set<Item>} */
+    const seenMarkerItems = new Set()
     if (node._searchMarker !== null) {
       for (let i = 0; i < node._searchMarker.length; i++) {
         const marker = node._searchMarker[i]
+        assertInvariant(
+          marker.p.marker === true,
+          `${label}: searchMarker[${i}] item ${fmtId(marker.p.id)} does not have marker bit set (marker=${String(marker.p.marker)})`
+        )
+        assertInvariant(
+          !seenMarkerItems.has(marker.p),
+          `${label}: duplicate searchMarker entry pointing to item ${fmtId(marker.p.id)}`
+        )
+        seenMarkerItems.add(marker.p)
         const actualOffset = itemOffsets.get(marker.p)
         assertInvariant(
           actualOffset !== undefined,
@@ -487,7 +531,39 @@ export const verifyDocInvariants = (doc, { expectNoPending = false, label = `doc
           marker.index === actualOffset,
           `${label}: searchMarker[${i}] index=${marker.index} !== actual offset=${String(actualOffset)} for item ${fmtId(marker.p.id)}`
         )
+        const fmtInfo = readMarkerFormats(marker)
+        if (fmtInfo.hasProp && (node._hasFormatting || fmtInfo.formats != null)) {
+          const expectedFormats = itemFormats.get(marker.p) ?? new Map()
+          const rawFormats = fmtInfo.formats
+          assertInvariant(
+            rawFormats === null || rawFormats === undefined || rawFormats instanceof Map,
+            `${label}: searchMarker[${i}] formats is neither null nor Map for item ${fmtId(marker.p.id)}`
+          )
+          /** @type {Map<string, unknown>} */
+          const actualFormats = rawFormats instanceof Map ? rawFormats : new Map()
+          assertInvariant(
+            actualFormats.size === expectedFormats.size,
+            `${label}: searchMarker[${i}] formats.size=${actualFormats.size} !== expected ${expectedFormats.size} at item ${fmtId(marker.p.id)}`
+          )
+          for (const [fk, fv] of expectedFormats.entries()) {
+            assertInvariant(
+              actualFormats.has(fk),
+              `${label}: searchMarker[${i}] missing format key "${fk}" at item ${fmtId(marker.p.id)}`
+            )
+            const cmp = deepEqualValues(actualFormats.get(fk), fv, `${label}.searchMarker[${i}].formats[${fk}]`)
+            assertInvariant(
+              cmp.equal,
+              `${label}: searchMarker[${i}] format "${fk}" mismatch at item ${fmtId(marker.p.id)} (${cmp.reason})`
+            )
+          }
+        }
       }
+    }
+    for (const marked of markedItems) {
+      assertInvariant(
+        seenMarkerItems.has(marked),
+        `${label}: item ${fmtId(marked.id)} has leaked marker bit (item.marker===true) not present in node._searchMarker`
+      )
     }
 
     // 2. Verify _map head pointers and backward chains

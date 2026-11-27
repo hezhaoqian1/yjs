@@ -1004,6 +1004,124 @@ const runContentAnyCowOracle = (seed, digests) => {
     const cmpFrozen = deepEqualValues(frozen.getContent(), [7, 8, 9], '3g.frozen')
     assertInvariant(cmpFrozen.equal, `3g: frozen ContentJSON mergeWith failed (${cmpFrozen.reason})`)
   }
+
+  // 3h. Observed getContent() reference anti-aliasing across push() / mergeWith() (ContentAny & ContentJSON)
+  {
+    const doc = new Y.Doc({ gc: false })
+    doc.clientID = 408
+    const arr = doc.get('array')
+    try {
+      arr.push([1, 2])
+      const item = arr._start
+      if (item === null) throw new InvariantError('3h: expected start item')
+      const observedAnyRef = item.content.getContent()
+      const observedAnySnap = JSON.stringify(observedAnyRef)
+      // Sequential pushes trigger ContentAny.mergeWith — must NEVER mutate observedAnyRef in place!
+      arr.push([3])
+      arr.push([4, 5])
+      assertInvariant(
+        observedAnyRef.length === 2 && JSON.stringify(observedAnyRef) === observedAnySnap,
+        `3h: ContentAny.mergeWith mutated previously observed getContent() array! before=${observedAnySnap}, after=${JSON.stringify(observedAnyRef)}`
+      )
+      const arrCmp = deepEqualValues(arr.toArray(), [1, 2, 3, 4, 5], '3h.toArray')
+      assertInvariant(arrCmp.equal, `3h: ContentAny array mismatch (${arrCmp.reason})`)
+      verifyDocInvariants(doc, { expectNoPending: true, label: '3h:getContent-cow' })
+    } finally {
+      doc.destroy()
+    }
+
+    const cj = new Y.ContentJSON(['x', 10])
+    const observedJsonRef = cj.getContent()
+    const observedJsonSnap = JSON.stringify(observedJsonRef)
+    cj.mergeWith(new Y.ContentJSON(['y', 20]))
+    cj.mergeWith(new Y.ContentJSON(['z']))
+    assertInvariant(
+      observedJsonRef.length === 2 && JSON.stringify(observedJsonRef) === observedJsonSnap,
+      `3h: ContentJSON.mergeWith mutated previously observed getContent() array! before=${observedJsonSnap}, after=${JSON.stringify(observedJsonRef)}`
+    )
+    const cjCmp = deepEqualValues(cj.getContent(), ['x', 10, 'y', 20, 'z'], '3h.json')
+    assertInvariant(cjCmp.equal, `3h: ContentJSON merged mismatch (${cjCmp.reason})`)
+  }
+
+  // 3i. Large-merge call-stack guard (> 70,000 elements, plus 130,000 right-hand spread guard — no RangeError!)
+  {
+    const anyLeft = new Y.ContentAny(new Array(35000).fill(1))
+    const anyRight = new Y.ContentAny(new Array(45000).fill(2))
+    anyLeft.mergeWith(anyRight)
+    assertInvariant(
+      anyLeft.getLength() === 80000 && anyLeft.arr[0] === 1 && anyLeft.arr[34999] === 1 && anyLeft.arr[35000] === 2 && anyLeft.arr[79999] === 2,
+      `3i: ContentAny 35k+45k merge mismatch (len=${anyLeft.getLength()})`
+    )
+    const anySmall = new Y.ContentAny([0])
+    const anyHuge = new Y.ContentAny(new Array(130000).fill(9))
+    anySmall.mergeWith(anyHuge)
+    assertInvariant(
+      anySmall.getLength() === 130001 && anySmall.arr[0] === 0 && anySmall.arr[1] === 9 && anySmall.arr[130000] === 9,
+      `3i: ContentAny 1+130k merge mismatch (len=${anySmall.getLength()})`
+    )
+
+    const jsonLeft = new Y.ContentJSON(new Array(35000).fill('a'))
+    const jsonRight = new Y.ContentJSON(new Array(45000).fill('b'))
+    jsonLeft.mergeWith(jsonRight)
+    assertInvariant(
+      jsonLeft.getLength() === 80000 && jsonLeft.arr[0] === 'a' && jsonLeft.arr[34999] === 'a' && jsonLeft.arr[35000] === 'b' && jsonLeft.arr[79999] === 'b',
+      `3i: ContentJSON 35k+45k merge mismatch (len=${jsonLeft.getLength()})`
+    )
+    const jsonSmall = new Y.ContentJSON(['s'])
+    const jsonHuge = new Y.ContentJSON(new Array(130000).fill('h'))
+    jsonSmall.mergeWith(jsonHuge)
+    assertInvariant(
+      jsonSmall.getLength() === 130001 && jsonSmall.arr[0] === 's' && jsonSmall.arr[1] === 'h' && jsonSmall.arr[130000] === 'h',
+      `3i: ContentJSON 1+130k merge mismatch (len=${jsonSmall.getLength()})`
+    )
+  }
+
+  // 3j. YNode.delta live cache & _fingerprint validity across sequential arr.push([obj])
+  {
+    const doc = new Y.Doc({ gc: false })
+    doc.clientID = 409
+    const arr = doc.get('array')
+    try {
+      arr.push([{ id: 0, tag: 'init' }])
+      const liveDelta = arr.delta
+      const snapBefore = arr.toDeltaDeep()
+      const expectedInitDelta = delta.create(delta.$deltaAny).insert([{ id: 0, tag: 'init' }]).done()
+      const snapBeforeJsonStr = JSON.stringify(snapBefore.toJSON())
+      // Prime cached _fingerprint on both liveDelta, snapBefore, and their child InsertOps
+      const fpInitial = liveDelta.fingerprint
+      const fpSnapBefore = snapBefore.fingerprint
+      for (const op of liveDelta.children) {
+        assertInvariant(typeof op.fingerprint === 'string' && op.fingerprint.length > 0, '3j: expected non-empty child op fingerprint')
+      }
+      assertInvariant(fpInitial === fpSnapBefore && liveDelta.equals(snapBefore), '3j: initial liveDelta !== toDeltaDeep()')
+
+      for (let i = 1; i <= 50; i++) {
+        arr.push([{ id: i, tag: `p${i}` }])
+        const fresh = arr.toDeltaDeep()
+        const fpLive = liveDelta.fingerprint
+        const fpFresh = fresh.fingerprint
+        const liveJsonCmp = deepEqualValues(liveDelta.toJSON(), fresh.toJSON(), `3j.push${i}`)
+        assertInvariant(
+          fpLive === fpFresh && liveDelta.equals(fresh) && liveJsonCmp.equal,
+          `3j: liveDelta/_fingerprint drifted after push #${i} (live=${fpLive}, fresh=${fpFresh}, ${liveJsonCmp.reason ?? 'ok'})`
+        )
+        assertInvariant(
+          fpLive !== fpInitial,
+          `3j: liveDelta fingerprint remained stale (=== initial) after push #${i}`
+        )
+        if (i === 1 || i === 50) {
+          const snapAfterJsonStr = JSON.stringify(snapBefore.toJSON())
+          assertInvariant(
+            snapBefore.fingerprint === fpSnapBefore && snapBefore.equals(expectedInitDelta) && snapAfterJsonStr === snapBeforeJsonStr,
+            `3j: earlier toDeltaDeep() snapshot mutated via aliased ContentAny.arr after push #${i} (before=${snapBeforeJsonStr}, after=${snapAfterJsonStr})`
+          )
+        }
+      }
+      verifyDocInvariants(doc, { expectNoPending: true, label: '3j:live-delta-fingerprint' })
+    } finally {
+      doc.destroy()
+    }
+  }
 }
 
 /**
