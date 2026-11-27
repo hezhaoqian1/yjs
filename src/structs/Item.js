@@ -651,6 +651,12 @@ export class ContentAny {
      * @type {Array<any>}
      */
     this.arr = arr
+    /**
+     * Copy-on-Write guard: true while `this.arr` may be aliased externally (caller input,
+     * `getContent()`, `copy()`, or `isDevMode` frozen arrays).
+     * @type {boolean}
+     */
+    this._shared = true
     isDevMode && object.deepFreeze(arr)
   }
 
@@ -665,6 +671,7 @@ export class ContentAny {
    * @return {Array<any>}
    */
   getContent () {
+    this._shared = true
     return this.arr
   }
 
@@ -679,6 +686,7 @@ export class ContentAny {
    * @return {ContentAny}
    */
   copy () {
+    this._shared = true
     return new ContentAny(this.arr)
   }
 
@@ -688,7 +696,9 @@ export class ContentAny {
    */
   splice (offset) {
     const right = new ContentAny(this.arr.slice(offset))
+    right._shared = isDevMode
     this.arr = this.arr.slice(0, offset)
+    this._shared = isDevMode
     return right
   }
 
@@ -697,7 +707,30 @@ export class ContentAny {
    * @return {boolean}
    */
   mergeWith (right) {
-    this.arr = this.arr.concat(right.arr)
+    if (isDevMode) {
+      this.arr = this.arr.concat(right.arr)
+      this._shared = true
+      return true
+    }
+    const larr = this.arr
+    const rarr = right.arr
+    const rlen = rarr.length
+    if (this._shared) {
+      const llen = larr.length
+      const merged = new Array(llen + rlen)
+      for (let i = 0; i < llen; i++) {
+        merged[i] = larr[i]
+      }
+      for (let i = 0; i < rlen; i++) {
+        merged[llen + i] = rarr[i]
+      }
+      this.arr = merged
+      this._shared = false
+    } else {
+      for (let i = 0; i < rlen; i++) {
+        larr.push(rarr[i])
+      }
+    }
     return true
   }
 
@@ -1233,6 +1266,12 @@ export class ContentJSON {
      * @type {Array<any>}
      */
     this.arr = arr
+    /**
+     * Copy-on-Write guard: true while `this.arr` may be aliased externally (caller input,
+     * `getContent()`, or `copy()`).
+     * @type {boolean}
+     */
+    this._shared = true
   }
 
   /**
@@ -1246,6 +1285,7 @@ export class ContentJSON {
    * @return {Array<any>}
    */
   getContent () {
+    this._shared = true
     return this.arr
   }
 
@@ -1260,6 +1300,7 @@ export class ContentJSON {
    * @return {ContentJSON}
    */
   copy () {
+    this._shared = true
     return new ContentJSON(this.arr)
   }
 
@@ -1269,7 +1310,9 @@ export class ContentJSON {
    */
   splice (offset) {
     const right = new ContentJSON(this.arr.slice(offset))
+    right._shared = false
     this.arr = this.arr.slice(0, offset)
+    this._shared = false
     return right
   }
 
@@ -1278,7 +1321,25 @@ export class ContentJSON {
    * @return {boolean}
    */
   mergeWith (right) {
-    this.arr = this.arr.concat(right.arr)
+    const larr = this.arr
+    const rarr = right.arr
+    const rlen = rarr.length
+    if (this._shared) {
+      const llen = larr.length
+      const merged = new Array(llen + rlen)
+      for (let i = 0; i < llen; i++) {
+        merged[i] = larr[i]
+      }
+      for (let i = 0; i < rlen; i++) {
+        merged[llen + i] = rarr[i]
+      }
+      this.arr = merged
+      this._shared = false
+    } else {
+      for (let i = 0; i < rlen; i++) {
+        larr.push(rarr[i])
+      }
+    }
     return true
   }
 
