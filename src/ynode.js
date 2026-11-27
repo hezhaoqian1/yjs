@@ -1762,9 +1762,13 @@ export class YNode extends ObservableV2 {
         } else if (delta.$deleteAttrOp.check(op)) {
           nodeMapDelete(transaction, /** @type {any} */ (this), /** @type {any} */ (op.key), renderer)
         } else {
-          // modifyAttr — locate the target renderer-aware: a deleted map value may still be rendered
-          const mapItem = this._map.get(/** @type {any} */ (op.key))
-          const sub = mapItem === undefined
+          // modifyAttr — locate the target renderer-aware: skip writes ignored by the renderer
+          // (mode === 2, e.g. future writes after a captured past state); a deleted map value may still be rendered
+          let mapItem = this._map.get(/** @type {any} */ (op.key)) ?? null
+          while (mapItem !== null && rendererMode(renderer, mapItem) === 2) {
+            mapItem = mapItem.left
+          }
+          const sub = mapItem === null
             ? undefined
             : (mapItem.deleted
                 ? (mapItem.content.constructor === ContentType && rendererContentLength(renderer, mapItem) > 0

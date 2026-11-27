@@ -2,7 +2,7 @@ import * as dpos from 'lib0/delta/position'
 import * as map from 'lib0/map'
 
 import { createRelativePosition, createAbsolutePositionFromRelativePosition } from './RelativePosition.js'
-import { rendererContentLength } from './renderer-helpers.js'
+import { rendererContentLength, rendererMode } from './renderer-helpers.js'
 import { getPathTo } from './YEvent.js'
 import { isParentOf } from './isParentOf.js'
 import { createID, findRootTypeKey } from './ID.js'
@@ -62,8 +62,11 @@ const contentTypeChild = item => item.content.constructor === ContentType ? /** 
  * @return {Item|null}
  */
 const mapItemGet = (node, key, renderer) => {
-  const it = node._map.get(key)
-  return it === undefined || (it.deleted && rendererContentLength(renderer, it) === 0) ? null : it
+  let it = node._map.get(key) ?? null
+  while (it !== null && rendererMode(renderer, it) === 2) {
+    it = it.left
+  }
+  return it === null || (it.deleted && rendererContentLength(renderer, it) === 0) ? null : it
 }
 
 /**
@@ -105,7 +108,9 @@ export const createRelativePositionsFromDeltaPositions = (root, positions, opts 
       // doc-rooted paths start with a root-type name; root types are not items, so a terminal
       // string at doc level has nothing to anchor
       if (typeof step0 !== 'string' || pos.path.length === 1) continue
-      map.setIfUndefined(layer, root.get(step0), () => /** @type {Array<Task>} */ ([])).push({ posIdx: i, pos, depth: 1 })
+      const rootNode = root.share.get(step0)
+      if (rootNode === undefined) continue
+      map.setIfUndefined(layer, rootNode, () => /** @type {Array<Task>} */ ([])).push({ posIdx: i, pos, depth: 1 })
     } else {
       map.setIfUndefined(layer, root, () => /** @type {Array<Task>} */ ([])).push({ posIdx: i, pos, depth: 0 })
     }
