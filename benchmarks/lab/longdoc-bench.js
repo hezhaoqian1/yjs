@@ -4,8 +4,8 @@ import * as Y from '../../src/index.js'
 import * as prng from 'lib0/prng'
 import * as math from 'lib0/math'
 
-const DEFAULT_SEED = 20261001
-const CHARS_PER_PAGE = 2300
+export const DEFAULT_SEED = 20261001
+export const CHARS_PER_PAGE = 2300
 
 /**
  * @typedef {'quick' | 'realistic'} BenchScale
@@ -27,7 +27,7 @@ const CHARS_PER_PAGE = 2300
  */
 
 /** @type {Record<BenchScale, ScaleConfig>} */
-const SCALE_CONFIGS = {
+export const SCALE_CONFIGS = {
   quick: {
     scale: 'quick',
     authors: 8,
@@ -134,7 +134,7 @@ const HEADING_MARKS = [
  * @param {Uint8Array | string} data
  * @return {string}
  */
-const sha256Hex = data => createHash('sha256').update(data).digest('hex')
+export const sha256Hex = data => createHash('sha256').update(data).digest('hex')
 
 /**
  * Compute percentile from an ascending sorted numeric array.
@@ -143,7 +143,7 @@ const sha256Hex = data => createHash('sha256').update(data).digest('hex')
  * @param {number} p
  * @return {number}
  */
-const percentile = (sorted, p) => {
+export const percentile = (sorted, p) => {
   if (sorted.length === 0) return 0
   if (sorted.length === 1) return sorted[0]
   const idx = (sorted.length - 1) * p
@@ -173,7 +173,7 @@ const summarizeMs = samples => {
 /**
  * Trigger V8 GC if exposed (--expose-gc).
  */
-const tryRunGc = () => {
+export const tryRunGc = () => {
   const maybeGc = /** @type {{ gc?: () => void }} */ (globalThis).gc
   if (typeof maybeGc === 'function') {
     maybeGc()
@@ -185,7 +185,7 @@ const tryRunGc = () => {
  *
  * @param {Y.Doc} doc
  */
-const inspectStructStore = doc => {
+export const inspectStructStore = doc => {
   let totalStructs = 0
   let aliveItems = 0
   let deletedItems = 0
@@ -255,7 +255,7 @@ const shiftCursorsOnDelete = (cursors, pos, delLen) => {
  * @param {ScaleConfig} cfg
  * @param {number} seed
  */
-const buildLongCollaborativeDoc = (cfg, seed) => {
+export const buildLongCollaborativeDoc = (cfg, seed) => {
   const gen = prng.create(seed)
   const master = new Y.Doc({ gc: true })
   const ytext = master.get('text')

@@ -1,0 +1,47 @@
+{
+  "version": 1,
+  "recordedAt": "2026-11-27T20:08:46.398Z",
+  "env": {
+    "node": "v24.19.0",
+    "platform": "win32-x64",
+    "cpu": "Intel(R) Core(TM) Ultra X7 358H",
+    "scale": "realistic",
+    "seed": 20261001,
+    "iters": 5
+  },
+  "docStats": {
+    "charLength": 259372,
+    "estimatedPages": 112.8,
+    "commentsLength": 2800,
+    "totalStructs": 68833,
+    "aliveItems": 61664,
+    "deletedItems": 7169,
+    "gcStructs": 0,
+    "buildMs": 1505.27
+  },
+  "wire": {
+    "v1Bytes": 1444062,
+    "v2Bytes": 1145996,
+    "v1Sha256": "c082a9b4a84aa12083ba84aeae188e47d65a515cf31d55f4b1f822caee6ae1bc",
+    "v2Sha256": "699a1e052e48ba44c414116b18dc972ef4d0ed2c470735c4a3bcee3920757eb1",
+    "deltaSha256": "0ab06886f46ee366a370fdaa52796ca034c3c7236c07599c779429b6fae10c4e"
+  },
+  "v1": {
+    "encodeMs": 43,
+    "encodeWallMs": 46.48,
+    "coldLoadMs": 485,
+    "coldLoadWallMs": 285.91,
+    "coldLoadPeakHeapBytes": 38241640,
+    "coldLoadRetainedHeapBytes": 18060904,
+    "coldLoadRssBytes": 238764032
+  },
+  "v2": {
+    "encodeMs": 52.75,
+    "encodeWallMs": 47.37,
+    "coldLoadMs": 547,
+    "coldLoadWallMs": 289.09,
+    "coldLoadPeakHeapBytes": 31964816,
+    "coldLoadRetainedHeapBytes": 18897752,
+    "coldLoadRssBytes": 239284224
+  }
+}
