@@ -498,7 +498,7 @@ const runLiveDeltaOracle = (seed, cfg, trace) => {
         deliverOne(peers[i], false)
       }
     }
-    for (let round = 0; round < 2; round++) {
+    for (let round = 0; round < 6; round++) {
       for (let i = 0; i < numPeers; i++) {
         const next = peers[(i + 1) % numPeers]
         const sv = Y.encodeStateVector(next.doc)
@@ -507,6 +507,21 @@ const runLiveDeltaOracle = (seed, cfg, trace) => {
         } else {
           Y.applyUpdateV2(next.doc, Y.encodeStateAsUpdateV2(peers[i].doc, sv), NETWORK_ORIGIN)
         }
+      }
+      if (round >= 1) {
+        const refCids = Y.createContentIdsFromDoc(peers[0].doc, true)
+        let allSynced = peers[0].doc.store.pendingStructs === null && peers[0].doc.store.pendingDs === null
+        for (let i = 1; allSynced && i < numPeers; i++) {
+          const d = peers[i].doc
+          if (
+            d.store.pendingStructs !== null ||
+            d.store.pendingDs !== null ||
+            !Y.equalContentIds(refCids, Y.createContentIdsFromDoc(d, true))
+          ) {
+            allSynced = false
+          }
+        }
+        if (allSynced) break
       }
     }
 
@@ -1192,11 +1207,26 @@ const runSnapshotWireAlgebraOracle = (seed, cfg, trace) => {
         }
       }
     }
-    for (let round = 0; round < 2; round++) {
+    for (let round = 0; round < 6; round++) {
       for (let i = 0; i < numPeers; i++) {
         const next = peers[(i + 1) % numPeers]
         const sv = Y.encodeStateVector(next.doc)
         Y.applyUpdate(next.doc, Y.encodeStateAsUpdate(peers[i].doc, sv), NETWORK_ORIGIN)
+      }
+      if (round >= 1) {
+        const refCids = Y.createContentIdsFromDoc(peers[0].doc, true)
+        let allSynced = peers[0].doc.store.pendingStructs === null && peers[0].doc.store.pendingDs === null
+        for (let i = 1; allSynced && i < numPeers; i++) {
+          const d = peers[i].doc
+          if (
+            d.store.pendingStructs !== null ||
+            d.store.pendingDs !== null ||
+            !Y.equalContentIds(refCids, Y.createContentIdsFromDoc(d, true))
+          ) {
+            allSynced = false
+          }
+        }
+        if (allSynced) break
       }
     }
 

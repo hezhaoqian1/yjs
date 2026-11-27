@@ -275,6 +275,25 @@ const docHasRedoneItems = doc => {
 }
 
 /**
+ * Check whether any deleted Item in a Doc has not been GC'd into ContentDeleted/GC
+ * (e.g. a gc:true peer whose UndoManager held keep=true during deletion and later cleared keep=false).
+ *
+ * @param {Doc} doc
+ * @return {boolean}
+ */
+const docHasUnGcdDeletedItems = doc => {
+  for (const structs of doc.store.clients.values()) {
+    for (let i = 0; i < structs.length; i++) {
+      const s = structs[i]
+      if (s instanceof Y.Item && s.deleted && !(s.content instanceof Y.ContentDeleted)) {
+        return true
+      }
+    }
+  }
+  return false
+}
+
+/**
  * Compute countable length represented by a node's deep delta children.
  *
  * @param {Y.Node} node
@@ -741,9 +760,10 @@ export const verifyConvergence = (
   const cidsVisible0 = Y.createContentIdsFromDoc(d0, false)
   const d0Kept = docHasKeptItems(d0)
   const d0Redone = docHasRedoneItems(d0)
+  const d0UnGcd = d0.gc && docHasUnGcdDeletedItems(d0)
   /** @type {Doc | null} */
   let canonicalD0 = null
-  if (d0Redone || (d0.gc && d0Kept)) {
+  if (d0Redone || (d0.gc && (d0Kept || d0UnGcd))) {
     canonicalD0 = new Y.Doc({ gc: d0.gc })
     Y.applyUpdate(canonicalD0, Y.encodeStateAsUpdate(d0))
   }
@@ -773,18 +793,23 @@ export const verifyConvergence = (
 
       const diKept = docHasKeptItems(di)
       const diRedone = docHasRedoneItems(di)
-      const directComparable = d0.gc === di.gc && !d0Redone && !diRedone && (!d0.gc || (!d0Kept && !diKept))
+      const diUnGcd = di.gc && docHasUnGcdDeletedItems(di)
+      const directComparable = d0.gc === di.gc && !d0Redone && !diRedone && (!d0.gc || (!d0Kept && !diKept && !d0UnGcd && !diUnGcd))
       const shouldCompareDirect = compareStores !== null ? compareStores : directComparable
       if (shouldCompareDirect) {
         compareStructStores(d0.store, di.store, label0, labeli)
-      } else if (compareStores !== false && d0.gc === di.gc && !d0.gc) {
-        // Same gc=false but local UndoManager `redone` blocked local Item.mergeWith:
-        // verify wire-canonical StructStore equivalence after roundtripping both docs
-        const refDoc = canonicalD0 ?? d0
+      } else if (compareStores !== false && d0.gc === di.gc) {
+        // Same gc mode but local UndoManager `redone`, `keep`, or post-clear() un-GC'd tombstones
+        // prevent raw StructStore equality: verify strict wire-canonical StructStore equivalence
+        // after roundtripping both docs through fresh Docs with the same gc mode
+        if (canonicalD0 === null) {
+          canonicalD0 = new Y.Doc({ gc: d0.gc })
+          Y.applyUpdate(canonicalD0, Y.encodeStateAsUpdate(d0))
+        }
         const freshI = new Y.Doc({ gc: di.gc })
         try {
           Y.applyUpdate(freshI, Y.encodeStateAsUpdate(di))
-          compareStructStores(refDoc.store, freshI.store, `${label0}[canonical]`, `${labeli}[canonical]`)
+          compareStructStores(canonicalD0.store, freshI.store, `${label0}[canonical]`, `${labeli}[canonical]`)
         } finally {
           freshI.destroy()
         }

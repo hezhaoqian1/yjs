@@ -662,6 +662,33 @@ const decodedItemClocks = (update, fmt) => {
 }
 
 /**
+ * Compute exact point-by-point non-Skip struct clocks integrated directly in a StructStore
+ * (excluding any unintegrated structs sitting in store.pendingStructs).
+ *
+ * @param {import('../../src/utils/StructStore.js').StructStore} store
+ * @return {Map<number, Set<number>>}
+ */
+const storeNonSkipClocks = store => {
+  /** @type {Map<number, Set<number>>} */
+  const out = new Map()
+  store.clients.forEach((structs, client) => {
+    for (let i = 0; i < structs.length; i++) {
+      const s = structs[i]
+      if (s instanceof Y.Skip) continue
+      let set = out.get(client)
+      if (set === undefined) {
+        set = new Set()
+        out.set(client, set)
+      }
+      for (let k = 0; k < s.length; k++) {
+        set.add(s.id.clock + k)
+      }
+    }
+  })
+  return out
+}
+
+/**
  * Suite 2: Skip-Gapped Partial Updates, BlockSet Merge, SV-From-Update, & Intersect Mid-Skip Oracle.
  *
  * @param {number} seed
@@ -890,17 +917,19 @@ const runSkipBlockSetWireSuite = (seed, cfg) => {
     assertEqualSetModels(decodedItemClocks(resInterV2, 'v2'), expectedInterClocks, 'S2:intersectMidSkip(V2)')
 
     // Direct writeStructsFromIdSet on pDocInterior.store with mid-Skip filterIns -> hits Skip.write(encoder, offset, offsetEnd) (catches BUG-SKIP-WRITE!)
+    // Note: writeStructsFromIdSet only encodes structs integrated in store.clients (not store.pendingStructs)
+    const expectedStoreInterClocks = intersectSetModels(storeNonSkipClocks(pDocInterior.store), idSetToModel(filterIns))
     const rawEncV1 = new Y.UpdateEncoderV1()
     writeStructsFromIdSet(rawEncV1, pDocInterior.store, filterIns)
     Y.writeIdSet(rawEncV1, Y.createIdSet())
     const rawSliceV1 = rawEncV1.toUint8Array()
-    assertEqualSetModels(decodedItemClocks(rawSliceV1, 'v1'), expectedInterClocks, 'S2:writeStructsFromIdSetMidSkip(V1)')
+    assertEqualSetModels(decodedItemClocks(rawSliceV1, 'v1'), expectedStoreInterClocks, 'S2:writeStructsFromIdSetMidSkip(V1)')
 
     const rawEncV2 = new Y.UpdateEncoderV2()
     writeStructsFromIdSet(rawEncV2, pDocInterior.store, filterIns)
     Y.writeIdSet(rawEncV2, Y.createIdSet())
     const rawSliceV2 = rawEncV2.toUint8Array()
-    assertEqualSetModels(decodedItemClocks(rawSliceV2, 'v2'), expectedInterClocks, 'S2:writeStructsFromIdSetMidSkip(V2)')
+    assertEqualSetModels(decodedItemClocks(rawSliceV2, 'v2'), expectedStoreInterClocks, 'S2:writeStructsFromIdSetMidSkip(V2)')
 
     const iDoc1 = own(new Y.Doc({ gc: false }))
     const iDoc2 = own(new Y.Doc({ gc: false }))
