@@ -267,7 +267,8 @@ const buildCraftedPayloads = () => {
    *   payload: Uint8Array<ArrayBuffer>,
    *   targets: Array<string>,
    *   mustReject: boolean,
-   *   description: string
+   *   description: string,
+   *   validateResult?: (res: unknown) => string | null
    * }} CraftedCase
    */
 
@@ -918,6 +919,97 @@ const buildCraftedPayloads = () => {
       description: 'IdMap with 5,000-deep nested readAny attribute value'
     })
   }
+  {
+    /**
+     * Verify decoded IdMap deduplicated [0,5) to 1 'alice', preserved both 'alice' and 'bob' on [5,10)
+     * (zero silent attribute erasure via idmapAttrsEqual), and canonically interned exactly 2 attrs.
+     *
+     * @param {unknown} res
+     * @return {string | null}
+     */
+    const validateDedupIdMap = res => {
+      if (!(res instanceof Y.IdMap)) return 'Did not return IdMap instance'
+      const attrs0 = res.slice(1, 0, 5)[0]?.attrs
+      const attrs1 = res.slice(1, 5, 5)[0]?.attrs
+      if (attrs0 === null || attrs0 === undefined || attrs0.length !== 1 || attrs0[0].val !== 'alice') {
+        return `Expected [0,5) deduplicated to 1 'alice', got len=${attrs0 ? attrs0.length : -1}`
+      }
+      if (
+        attrs1 === null || attrs1 === undefined || attrs1.length !== 2 ||
+        !attrs1.some(a => a.val === 'alice') || !attrs1.some(a => a.val === 'bob')
+      ) {
+        return `Expected [5,10) to preserve both 'alice' and 'bob', got ${attrs1 ? attrs1.map(a => String(a.val)).join(',') : 'null'}`
+      }
+      if (res.attrs.size !== 2 || res.attrsH.size !== 2) {
+        return `Expected canonical interning size=2, got attrs.size=${res.attrs.size}, attrsH.size=${res.attrsH.size}`
+      }
+      return null
+    }
+
+    // Vector A: IdMap with repeated attrId [0, 0] on [0,5) adjacent to [0, 1] on [5,10) (BUG-IDMAP-ADD-DUP)
+    const encA = encoding.createEncoder()
+    encoding.writeVarUint(encA, 1) // numClients = 1
+    encoding.writeVarUint(encA, 1) // clientDiff = 1 (client = 1)
+    encoding.writeVarUint(encA, 2) // numRanges = 2
+    // Range 0: clock=0, len=5, attrs=[attrId 0 ('insert','alice'), attrId 0]
+    encoding.writeVarUint(encA, 0)
+    encoding.writeVarUint(encA, 4)
+    encoding.writeVarUint(encA, 2)
+    encoding.writeVarUint(encA, 0)
+    encoding.writeVarUint(encA, 0)
+    encoding.writeVarString(encA, 'insert')
+    encoding.writeAny(encA, 'alice')
+    encoding.writeVarUint(encA, 0) // duplicate attrId = 0
+    // Range 1: clock=5, len=5, attrs=[attrId 0, attrId 1 ('insert','bob')]
+    encoding.writeVarUint(encA, 0)
+    encoding.writeVarUint(encA, 4)
+    encoding.writeVarUint(encA, 2)
+    encoding.writeVarUint(encA, 0)
+    encoding.writeVarUint(encA, 1)
+    encoding.writeVarUint(encA, 0)
+    encoding.writeAny(encA, 'bob')
+    cases.push({
+      name: 'idmap_duplicate_attrId_adjacent_merge',
+      payload: toArrayBufferCopy(encoding.toUint8Array(encA)),
+      targets: ['decodeIdMap'],
+      mustReject: false,
+      description: 'IdMap repeating attrId=0 on [0,5) adjacent to [0,1] on [5,10) must deduplicate and preserve bob',
+      validateResult: validateDedupIdMap
+    })
+
+    // Vector B: IdMap defining TWO distinct attrIds (0 & 1) with equal (name, val) hash on [0,5) adjacent to [0, 2] on [5,10)
+    const encB = encoding.createEncoder()
+    encoding.writeVarUint(encB, 1) // numClients = 1
+    encoding.writeVarUint(encB, 1) // clientDiff = 1 (client = 1)
+    encoding.writeVarUint(encB, 2) // numRanges = 2
+    // Range 0: clock=0, len=5, attrs=[attrId 0 ('insert','alice'), attrId 1 ('insert','alice')]
+    encoding.writeVarUint(encB, 0)
+    encoding.writeVarUint(encB, 4)
+    encoding.writeVarUint(encB, 2)
+    encoding.writeVarUint(encB, 0) // new attrId = 0
+    encoding.writeVarUint(encB, 0) // new attrNameId = 0 ('insert')
+    encoding.writeVarString(encB, 'insert')
+    encoding.writeAny(encB, 'alice')
+    encoding.writeVarUint(encB, 1) // distinct attrId = 1 with EQUAL ('insert', 'alice')!
+    encoding.writeVarUint(encB, 0) // known attrNameId = 0 ('insert')
+    encoding.writeAny(encB, 'alice')
+    // Range 1: clock=5, len=5, attrs=[attrId 0 ('insert','alice'), attrId 2 ('insert','bob')]
+    encoding.writeVarUint(encB, 0)
+    encoding.writeVarUint(encB, 4)
+    encoding.writeVarUint(encB, 2)
+    encoding.writeVarUint(encB, 0)
+    encoding.writeVarUint(encB, 2) // new attrId = 2
+    encoding.writeVarUint(encB, 0) // known attrNameId = 0 ('insert')
+    encoding.writeAny(encB, 'bob')
+    cases.push({
+      name: 'idmap_duplicate_equal_attr_values',
+      payload: toArrayBufferCopy(encoding.toUint8Array(encB)),
+      targets: ['decodeIdMap'],
+      mustReject: false,
+      description: 'IdMap defining distinct attrIds 0 & 1 with equal (name,val) must canonically intern, deduplicate, and preserve bob',
+      validateResult: validateDedupIdMap
+    })
+  }
 
   // 18. decodeStateVector huge ssLength
   {
@@ -1323,7 +1415,8 @@ export const runMalformedBinarySuite = ({ seed, timeoutMs, verbose }) => {
   }
 
   /**
-   * Validate a decoded IdMap contains no undefined attributes or invalid hashes.
+   * Validate a decoded IdMap contains no undefined attributes, no duplicate equal hashes per range,
+   * canonical attrs/attrsH interning, and clean re-encodability.
    *
    * @param {unknown} res
    * @return {string | null}
@@ -1334,10 +1427,20 @@ export const runMalformedBinarySuite = ({ seed, timeoutMs, verbose }) => {
       const ids = ranges.getIds()
       for (let i = 0; i < ids.length; i++) {
         const r = ids[i]
+        /** @type {Set<string>} */
+        const seenHashes = new Set()
         for (let j = 0; j < r.attrs.length; j++) {
           const a = r.attrs[j]
           if (a === undefined || a === null || typeof a.name !== 'string') {
             return `IdMap client=${client} contains invalid/undefined ContentAttribute (name=${String(a?.name)})`
+          }
+          const h = a.hash()
+          if (seenHashes.has(h)) {
+            return `IdMap client=${client}@${r.clock} contains duplicate equal ContentAttribute (${a.name})`
+          }
+          seenHashes.add(h)
+          if (!res.attrs.has(a) || res.attrsH.get(h) !== a) {
+            return `IdMap client=${client}@${r.clock} ContentAttribute (${a.name}) is not canonically interned in attrs/attrsH`
           }
         }
       }
@@ -1358,8 +1461,9 @@ export const runMalformedBinarySuite = ({ seed, timeoutMs, verbose }) => {
    * @param {string} entryPoint
    * @param {Uint8Array<ArrayBuffer>} payload
    * @param {boolean} [mustReject]
+   * @param {(res: unknown) => string | null} [extraValidate]
    */
-  const runTarget = (category, payloadName, entryPoint, payload, mustReject = false) => {
+  const runTarget = (category, payloadName, entryPoint, payload, mustReject = false, extraValidate) => {
     switch (entryPoint) {
       case 'applyUpdate':
         testApplyEntryPoint({ category, payloadName, entryPoint: 'applyUpdate', payload, mustReject })
@@ -1415,7 +1519,19 @@ export const runMalformedBinarySuite = ({ seed, timeoutMs, verbose }) => {
         testPureEntryPoint({ category, payloadName, entryPoint, payload, mustReject, fn: () => Y.decodeIdSet(payload) })
         break
       case 'decodeIdMap':
-        testPureEntryPoint({ category, payloadName, entryPoint, payload, mustReject, fn: () => Y.decodeIdMap(payload), validateResult: validateIdMapResult })
+        testPureEntryPoint({
+          category,
+          payloadName,
+          entryPoint,
+          payload,
+          mustReject,
+          fn: () => Y.decodeIdMap(payload),
+          validateResult: res => {
+            const baseErr = validateIdMapResult(res)
+            if (baseErr !== null) return baseErr
+            return extraValidate ? extraValidate(res) : null
+          }
+        })
         break
     }
   }
@@ -1558,7 +1674,7 @@ export const runMalformedBinarySuite = ({ seed, timeoutMs, verbose }) => {
   for (let i = 0; i < crafted.length; i++) {
     const c = crafted[i]
     for (let t = 0; t < c.targets.length; t++) {
-      runTarget('crafted-security', c.name, c.targets[t], c.payload, c.mustReject)
+      runTarget('crafted-security', c.name, c.targets[t], c.payload, c.mustReject, c.validateResult)
     }
   }
 
