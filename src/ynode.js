@@ -337,11 +337,18 @@ const insertFormats = (transaction, parent, currPos, formats) => {
  * @function
  **/
 export const insertContent = (transaction, parent, currPos, content, formats) => {
-  currPos.currentFormats.forEach((_val, key) => {
-    if (formats[key] === undefined) {
-      formats[key] = null
+  if (currPos.currentFormats.size > 0) {
+    let cloned = false
+    for (const key of currPos.currentFormats.keys()) {
+      if (formats[key] === undefined) {
+        if (!cloned) {
+          formats = object.assign({}, formats)
+          cloned = true
+        }
+        formats[key] = null
+      }
     }
-  })
+  }
   const doc = transaction.doc
   const ownClientId = doc.clientID
   minimizeFormatChanges(currPos, formats)
