@@ -1409,7 +1409,7 @@ export class YNode extends ObservableV2 {
                   : attribution
                 if (c.deleted && c.content.constructor === ContentType) {
                   // @todo use current transaction instead
-                  d.modify(/** @type {any} */ (c.content).type.toDelta(optsAll), undefined, retainAttribution ?? null)
+                  d.modify(/** @type {any} */ (c.content).type.toDelta(optsAll), undefined, retainAttribution ?? clearedOwnAttribution())
                 } else if (c.content.constructor === ContentType && modified?.has(/** @type {ContentType} */ (c.content).type)) {
                   // a de/re-attributed node the renderer still claims (e.g. a partial accept):
                   // merge/clear its own attribution and descend so the nested walk heals exactly
@@ -1432,12 +1432,12 @@ export class YNode extends ObservableV2 {
             } else if (renderDelete) {
               d.delete(c.content.getLength())
             } else if (retainContent) {
+              d.useFormats(changedFormats)
+              usingChangedFormats = true
               if (c.content.constructor === ContentType && modified?.has(/** @type {ContentType} */ (c.content).type)) {
                 // @todo use current transaction instead
                 d.modify(/** @type {any} */ (c.content).type.toDelta(optsAll))
               } else {
-                d.useFormats(changedFormats)
-                usingChangedFormats = true
                 d.retain(c.content.getLength())
               }
             }
@@ -1705,15 +1705,17 @@ export class YNode extends ObservableV2 {
                 itemContent = itemContent.splice(idrange.len)
               }
               if (!idrange.exists) {
+                d.useFormats(changedFormats)
+                usingChangedFormats = true
                 if (content.constructor === ContentType && modified?.has(/** @type {ContentType} */ (content).type)) {
                   // @todo use current transaction instead
                   d.modify(/** @type {ContentType} */ (content).type.toDelta(optsAll))
                 } else {
-                  d.useFormats(changedFormats)
-                  usingChangedFormats = true
                   d.retain(idrange.len)
                 }
               } else if (retainInserts) {
+                d.useFormats(changedFormats)
+                usingChangedFormats = true
                 if (content.constructor === ContentType && modified?.has(/** @type {ContentType} */ (content).type)) {
                   // a de/re-attributed node (e.g. its insert-suggestion was accepted): clear its
                   // own attribution and descend so the nested walk heals exactly the child ids
@@ -1721,8 +1723,6 @@ export class YNode extends ObservableV2 {
                   // attribution (id-scoped, never a blanket subtree clear)
                   d.modify(/** @type {ContentType} */ (content).type.toDelta(optsAll), undefined, clearedOwnAttribution())
                 } else {
-                  d.useFormats(changedFormats)
-                  usingChangedFormats = true
                   d.retain(idrange.len, undefined, clearedOwnAttribution())
                 }
               } else {

@@ -1917,6 +1917,115 @@ export const REPRODUCERS = [
         doc.destroy()
       }
     }
+  },
+  {
+    id: 'BUG-DELTA-MODIFY-FORMATS',
+    title: 'toDelta change-render leaks currentFormats or drops changedFormats onto d.modify() for modified ContentType children',
+    targetPr: 'PR #5',
+    run: () => {
+      // Part A & Part B: plain mode (mode === 0) stale currentFormats leak + dropped changedFormats diff
+      const doc = new Y.Doc({ gc: false })
+      doc.clientID = 1
+      const v1 = new Y.Doc({ gc: false })
+      v1.clientID = 1
+      /** @type {Y.Doc | null} */
+      let v2 = null
+      /** @type {Y.DiffRenderer | null} */
+      let renderer = null
+      try {
+        const root = doc.get('root')
+        const child = new Y.Node('p')
+        root.insert(0, 'ab')
+        root.insert(2, [child])
+        child.insert(0, 'hi')
+
+        const live = root.delta
+        const rep = delta.create(delta.$deltaAny)
+        rep.isFinal = true
+        rep.apply(root.toDeltaDeep())
+        root.on('delta', d => { rep.apply(d) })
+
+        // Part A: formatted insert IMMEDIATELY before modified child (no retained item in between)
+        // must NOT leak bold/italic onto <p> via d.modify()
+        doc.transact(() => {
+          root.insert(2, 'X', { bold: true, italic: true })
+          child.insert(2, '!')
+        })
+        const freshA = root.toDeltaDeep()
+        const cmpLiveA = deepEqualValues(live.toJSON(), freshA.toJSON(), 'BUG-DELTA-MODIFY-FORMATS(A).live')
+        const cmpRepA = deepEqualValues(rep.toJSON(), freshA.toJSON(), 'BUG-DELTA-MODIFY-FORMATS(A).rep')
+        assertInvariant(
+          live.equals(freshA) && cmpLiveA.equal,
+          `BUG-DELTA-MODIFY-FORMATS(A): live .delta leaked currentFormats onto modified child (${cmpLiveA.reason ?? 'equals=false'})\n  live:  ${JSON.stringify(live.toJSON())}\n  fresh: ${JSON.stringify(freshA.toJSON())}`
+        )
+        assertInvariant(
+          rep.equals(freshA) && cmpRepA.equal,
+          `BUG-DELTA-MODIFY-FORMATS(A): replayed 'delta' leaked currentFormats onto modified child (${cmpRepA.reason ?? 'equals=false'})`
+        )
+
+        // Part B: formatting change starting directly on modified child at index 0 (no prior retained item
+        // calling d.useFormats(changedFormats)) must NOT drop changedFormats on d.modify()
+        const rootB = doc.get('rootB')
+        const childB = new Y.Node('p')
+        rootB.insert(0, [childB])
+        childB.insert(0, 'hi')
+        rootB.insert(1, 'tail')
+        const liveB = rootB.delta
+        const repB = delta.create(delta.$deltaAny)
+        repB.isFinal = true
+        repB.apply(rootB.toDeltaDeep())
+        rootB.on('delta', d => { repB.apply(d) })
+        doc.transact(() => {
+          rootB.format(0, 1, { color: '#08c' })
+          childB.insert(childB.length, '?')
+        })
+        const freshB = rootB.toDeltaDeep()
+        const cmpLiveB = deepEqualValues(liveB.toJSON(), freshB.toJSON(), 'BUG-DELTA-MODIFY-FORMATS(B).live')
+        const cmpRepB = deepEqualValues(repB.toJSON(), freshB.toJSON(), 'BUG-DELTA-MODIFY-FORMATS(B).rep')
+        assertInvariant(
+          liveB.equals(freshB) && cmpLiveB.equal,
+          `BUG-DELTA-MODIFY-FORMATS(B): live .delta dropped changedFormats on modified child (${cmpLiveB.reason ?? 'equals=false'})\n  live:  ${JSON.stringify(liveB.toJSON())}\n  fresh: ${JSON.stringify(freshB.toJSON())}`
+        )
+        assertInvariant(
+          repB.equals(freshB) && cmpRepB.equal,
+          `BUG-DELTA-MODIFY-FORMATS(B): replayed 'delta' dropped changedFormats on modified child (${cmpRepB.reason ?? 'equals=false'})`
+        )
+
+        // Part C: DiffRenderer mode 1 retainContent d.modify() path (formatted insert immediately before <p>)
+        const r1 = v1.get('root')
+        const p1 = new Y.Node('p')
+        r1.insert(0, 'a')
+        r1.insert(1, [p1])
+        p1.insert(0, 'hi')
+
+        v2 = Y.cloneDoc(v1, { gc: false })
+        v2.clientID = 2
+        renderer = Y.createDiffRenderer(v1, v2)
+        const r2 = v2.get('root')
+        r2.useRenderer(renderer)
+        const live2 = r2.delta
+
+        v2.transact(() => {
+          r2.insert(1, 'Z', { bold: true })
+          const p2 = r2.get(2)
+          if (!(p2 instanceof Y.Node)) {
+            throw new InvariantError('BUG-DELTA-MODIFY-FORMATS(C): expected cloned Y.Node child at index 2')
+          }
+          p2.insert(2, '!')
+        })
+        const freshC = r2.toDeltaDeep()
+        const cmpLiveC = deepEqualValues(live2.toJSON(), freshC.toJSON(), 'BUG-DELTA-MODIFY-FORMATS(C).live2')
+        assertInvariant(
+          live2.equals(freshC) && cmpLiveC.equal,
+          `BUG-DELTA-MODIFY-FORMATS(C): DiffRenderer live .delta drifted on modified child (${cmpLiveC.reason ?? 'equals=false'})\n  live:  ${JSON.stringify(live2.toJSON())}\n  fresh: ${JSON.stringify(freshC.toJSON())}`
+        )
+      } finally {
+        renderer?.destroy()
+        v2?.destroy()
+        v1.destroy()
+        doc.destroy()
+      }
+    }
   }
 ]
 
