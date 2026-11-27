@@ -82,11 +82,13 @@ export const createContentIdsFromSnapshot = (snapshot, insertsContainDeletes) =>
 }
 
 /**
+ * Compute the content ids present in `ydocNext` that are not yet in `ydocPrev` (`next \ prev`).
+ *
  * @param {import('./Doc.js').Doc} ydocPrev
  * @param {import('./Doc.js').Doc} ydocNext
  */
 export const createContentIdsFromDocDiff = (ydocPrev, ydocNext) =>
-  excludeContentIds(createContentIdsFromDoc(ydocPrev, true), createContentIdsFromDoc(ydocNext, true))
+  excludeContentIds(createContentIdsFromDoc(ydocNext, true), createContentIdsFromDoc(ydocPrev, true))
 
 /**
  * @param {ContentIds} content
