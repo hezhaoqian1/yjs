@@ -1411,7 +1411,7 @@ export class YNode extends ObservableV2 {
               // copy that is never installed, so the key survives on the following spans and the
               // change render must NOT clear it.
               const isRangeEndClear = attribution == null && sameAsPreviousAttributions && renderContent && !c.deleted && itemsToRender != null && renderer !== null && object.hasProperty(previousUnattributedFormats, key) && object.every(changedAttributedFormats, (_v, k) => k === key)
-              if (isDeletedFormatClear || (isAcceptedFormatClear && changedAttributedFormats[key] == null)) {
+              if ((isDeletedFormatClear || isAcceptedFormatClear) && changedAttributedFormats[key] == null) {
                 // uniformly emit the per-key clear — also for a marker that *ends* a formerly
                 // attributed range: the attributed render emits a trailing per-key `null` past
                 // the closing marker as well (see the `attribution != null` case below), so the
@@ -1419,12 +1419,12 @@ export class YNode extends ObservableV2 {
                 // attribution the clear merges as a no-op.
                 changedAttributedFormats[key] = null
                 delete previousUnattributedFormats[key]
-              } else if (isAcceptedFormatClear) {
-                // accepted marker inside a *still-attributed* (pending) range for the same key —
-                // the ambient context holds an attributor list, not a clear. Relative to the base
-                // doc the effective format of this span is still a suggested change, so the fresh
-                // render keeps attributing it (the `skip` case below): keep the ambient
-                // attribution rather than clearing it.
+              } else if (isDeletedFormatClear || isAcceptedFormatClear) {
+                // deleted or accepted marker inside a *still-attributed* (pending) range for the
+                // same key — the ambient context holds an attributor list, not a clear. Relative
+                // to the base doc the effective format of this span is still a suggested change,
+                // so the fresh render keeps attributing it (the `skip` case below): keep the
+                // ambient attribution rather than clearing it.
               } else if (attribution == null && !sameAsPreviousAttributions) {
                 // skip
               } else if (attribution == null || sameAsPreviousAttributions) {
