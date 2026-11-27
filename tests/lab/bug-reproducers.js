@@ -1,6 +1,9 @@
 import * as Y from '../../src/index.js'
+import { writeStructsFromIdSet } from '../../src/utils/encoding-helpers.js'
 import * as encoding from 'lib0/encoding'
-import { assertInvariant, InvariantError, verifyDocInvariants } from './invariants.js'
+import * as delta from 'lib0/delta'
+import * as dpos from 'lib0/delta/position'
+import { assertInvariant, equalBytes, InvariantError, verifyDocInvariants } from './invariants.js'
 
 /**
  * @typedef {{
@@ -799,6 +802,1010 @@ export const REPRODUCERS = [
         prev.destroy()
         next.destroy()
       }
+    }
+  },
+  {
+    id: 'BUG-DELTA-LEN1',
+    title: 'YNode.toDelta hardcodes retain(1)/delete(1) on multi-element ContentAny/ContentJSON, corrupting live .delta & delta events',
+    targetPr: 'PR #2b',
+    run: () => {
+      // Part A: Default fast path (src/ynode.js L1547) — sequential push reverses arr.delta & emits wrong retain(1)
+      const docPush = new Y.Doc({ gc: false })
+      docPush.clientID = 1
+      const arrPush = docPush.get('array')
+      const livePush = arrPush.delta
+      /** @type {Array<unknown>} */
+      const emittedPush = []
+      const replayedPush = delta.create(delta.$deltaAny)
+      replayedPush.isFinal = true
+      arrPush.on('delta', d => {
+        emittedPush.push(d.toJSON())
+        replayedPush.apply(d)
+      })
+
+      // Part B: Default fast path (src/ynode.js L1504) — multi-element delete emits delete(1) leaving zombie elements
+      const docDel = new Y.Doc({ gc: false })
+      docDel.clientID = 2
+      const arrDel = docDel.get('array')
+      arrDel.insert(0, [10, 20, 30, 40])
+      const liveDel = arrDel.delta
+      /** @type {Array<unknown>} */
+      const emittedDel = []
+      arrDel.on('delta', d => emittedDel.push(d.toJSON()))
+
+      // Part C1: AttributionsRenderer processContent path (src/ynode.js L1271) — retainContent on multi-element slice
+      const docRendPush = new Y.Doc({ gc: false })
+      docRendPush.clientID = 3
+      const arrRendPush = docRendPush.get('array')
+      const cmapPush = Y.createContentMap()
+      cmapPush.inserts.add(3, 0, 1, [Y.createContentAttribute('insert', 'alice')])
+      const rendPush = Y.createAttributionsRenderer(cmapPush)
+      arrRendPush.useRenderer(rendPush)
+      const liveRendPush = arrRendPush.delta
+
+      // Part C2: AttributionsRenderer processContent path (src/ynode.js L1263) — renderDelete on multi-element slice
+      const docRendDel = new Y.Doc({ gc: false })
+      docRendDel.clientID = 4
+      const arrRendDel = docRendDel.get('array')
+      arrRendDel.insert(0, [10, 20, 30, 40])
+      const cmapDel = Y.createContentMap()
+      cmapDel.inserts.add(4, 0, 1, [Y.createContentAttribute('insert', 'bob')])
+      const rendDel = Y.createAttributionsRenderer(cmapDel)
+      arrRendDel.useRenderer(rendDel)
+      const liveRendDel = arrRendDel.delta
+      /** @type {Array<{ type: string, delete?: number }>} */
+      const rendDelOps = []
+      arrRendDel.on('delta', d => {
+        for (const op of d.children) {
+          if (delta.$deleteOp.check(op)) {
+            rendDelOps.push({ type: 'delete', delete: op.delete })
+          }
+        }
+      })
+
+      try {
+        // Execute Part A
+        arrPush.push([0])
+        arrPush.push([1])
+        arrPush.push([2])
+        arrPush.push([3])
+        const freshPush = arrPush.toDeltaDeep()
+        assertInvariant(
+          JSON.stringify(arrPush.toArray()) === '[0,1,2,3]',
+          `BUG-DELTA-LEN1(A): ground-truth array mismatch (${JSON.stringify(arrPush.toArray())})`
+        )
+        assertInvariant(
+          livePush.equals(freshPush),
+          `BUG-DELTA-LEN1(A): arr.delta corrupted on sequential push!\n  live:  ${JSON.stringify(livePush.toJSON())}\n  fresh: ${JSON.stringify(freshPush.toJSON())}`
+        )
+        assertInvariant(
+          replayedPush.equals(freshPush),
+          `BUG-DELTA-LEN1(A): replaying 'delta' events diverged from toDeltaDeep()!\n  replayed: ${JSON.stringify(replayedPush.toJSON())}\n  fresh:    ${JSON.stringify(freshPush.toJSON())}`
+        )
+        const expectedPush2 = JSON.stringify(delta.create(delta.$deltaAny).retain(2).insert([2]).done().toJSON())
+        const expectedPush3 = JSON.stringify(delta.create(delta.$deltaAny).retain(3).insert([3]).done().toJSON())
+        assertInvariant(
+          emittedPush.length === 4 &&
+          JSON.stringify(emittedPush[2]) === expectedPush2 &&
+          JSON.stringify(emittedPush[3]) === expectedPush3,
+          `BUG-DELTA-LEN1(A): incremental 'delta' events had wrong retain length (ev[2]=${JSON.stringify(emittedPush[2])}, ev[3]=${JSON.stringify(emittedPush[3])})`
+        )
+
+        // Execute Part B
+        arrDel.delete(0, 3)
+        const freshDel = arrDel.toDeltaDeep()
+        assertInvariant(
+          liveDel.equals(freshDel),
+          `BUG-DELTA-LEN1(B): arr.delta under-deleted on delete(0, 3)!\n  live:  ${JSON.stringify(liveDel.toJSON())}\n  fresh: ${JSON.stringify(freshDel.toJSON())}`
+        )
+        const expectedDel3 = JSON.stringify(delta.create(delta.$deltaAny).delete(3).done().toJSON())
+        assertInvariant(
+          emittedDel.length === 1 && JSON.stringify(emittedDel[0]) === expectedDel3,
+          `BUG-DELTA-LEN1(B): incremental 'delta' event emitted wrong delete length (got ${JSON.stringify(emittedDel[0])}, expected ${expectedDel3})`
+        )
+
+        // Execute Part C1 (AttributionsRenderer retainContent on len>1 ContentAny slice)
+        arrRendPush.push([0])
+        arrRendPush.push([1])
+        arrRendPush.push([2])
+        arrRendPush.push([3])
+        const freshRendPush = arrRendPush.toDeltaDeep()
+        assertInvariant(
+          liveRendPush.equals(freshRendPush),
+          `BUG-DELTA-LEN1(C1): AttributionsRenderer arr.delta corrupted on sequential push!\n  live:  ${JSON.stringify(liveRendPush.toJSON())}\n  fresh: ${JSON.stringify(freshRendPush.toJSON())}`
+        )
+
+        // Execute Part C2 (AttributionsRenderer renderDelete on len>1 ContentAny slice [20, 30])
+        arrRendDel.delete(0, 3)
+        /** @type {Array<unknown>} */
+        const liveRendDelElems = []
+        for (const op of liveRendDel.children) {
+          if (delta.$insertOp.check(op)) {
+            liveRendDelElems.push(...op.insert)
+          }
+        }
+        assertInvariant(
+          rendDelOps.length === 1 && rendDelOps[0].delete === 2,
+          `BUG-DELTA-LEN1(C2): AttributionsRenderer 'delta' event emitted wrong delete length (got ${JSON.stringify(rendDelOps)}, expected delete=2 for [20, 30])`
+        )
+        assertInvariant(
+          JSON.stringify(liveRendDelElems) === '[10,40]',
+          `BUG-DELTA-LEN1(C2): AttributionsRenderer arr.delta left zombie elements on delete(0, 3)! got ${JSON.stringify(liveRendDelElems)}, expected [10,40]`
+        )
+      } finally {
+        rendPush.destroy()
+        rendDel.destroy()
+        docPush.destroy()
+        docDel.destroy()
+        docRendPush.destroy()
+        docRendDel.destroy()
+      }
+    }
+  },
+  {
+    id: 'TX-3',
+    title: 'cleanupYTextAfterTransaction runs transact(doc, ...) with default origin=null/local=true, polluting UndoManager undoStack & wiping redoStack',
+    targetPr: 'PR #3',
+    run: () => {
+      const doc1 = new Y.Doc({ gc: false })
+      const doc2 = new Y.Doc({ gc: false })
+      doc1.clientID = 1
+      doc2.clientID = 2
+      const ytext1 = doc1.get('text')
+      const ytext2 = doc2.get('text')
+      ytext1.insert(0, 'hello')
+      Y.applyUpdate(doc2, Y.encodeStateAsUpdate(doc1))
+
+      const um = new Y.UndoManager(ytext1, { captureTimeout: 0 })
+      try {
+        // Build 1 undo entry + 1 redo entry on doc1 (with formatting active so _hasFormatting=true)
+        ytext1.format(0, 5, { bold: true })
+        um.stopCapturing()
+        ytext1.insert(5, '!')
+        um.stopCapturing()
+        um.undo()
+        assertInvariant(
+          um.undoStack.length === 1 && um.redoStack.length === 1,
+          `TX-3: setup expected undo=1,redo=1, got undo=${um.undoStack.length},redo=${um.redoStack.length}`
+        )
+
+        // Concurrently on doc2 (unaware of doc1's bold), apply the same bold format -> duplicate ContentFormat markers
+        ytext2.format(0, 5, { bold: true })
+        const remoteUpdate = Y.encodeStateAsUpdate(doc2, Y.encodeStateVector(doc1))
+
+        // Apply remote update with non-tracked origin 'remote' -> triggers cleanupYTextAfterTransaction
+        Y.applyUpdate(doc1, remoteUpdate, 'remote')
+
+        assertInvariant(
+          um.undoStack.length === 1 && um.redoStack.length === 1,
+          `TX-3: remote formatting cleanup polluted UndoManager! expected undo=1,redo=1, got undo=${um.undoStack.length},redo=${um.redoStack.length}`
+        )
+      } finally {
+        um.destroy()
+        doc1.destroy()
+        doc2.destroy()
+      }
+    }
+  },
+  {
+    id: 'DOC-2',
+    title: 'subdoc.load() sets shouldLoad=true after transact(), so shouldLoad is still false inside synchronous parent subdocs callback',
+    targetPr: 'PR #3',
+    run: () => {
+      const parent = new Y.Doc()
+      const sub = new Y.Doc({ shouldLoad: false, autoLoad: false })
+      /** @type {Array<boolean>} */
+      const observedShouldLoad = []
+      try {
+        parent.get('array').insert(0, [sub])
+        parent.on('subdocs', ({ loaded }) => {
+          if (loaded.has(sub)) {
+            observedShouldLoad.push(sub.shouldLoad)
+          }
+        })
+        sub.load()
+        assertInvariant(
+          observedShouldLoad.length === 1 && observedShouldLoad[0] === true,
+          `DOC-2: inside parent 'subdocs' callback, subdoc.shouldLoad was ${JSON.stringify(observedShouldLoad)} (expected [true])`
+        )
+      } finally {
+        sub.destroy()
+        parent.destroy()
+      }
+    }
+  },
+  {
+    id: 'R-3',
+    title: 'DiffRenderer.rejectChanges assigns shorter prevDoc Content onto longer GCd ContentDeleted Item, breaking Item.length === content.getLength()',
+    targetPr: 'PR #5',
+    run: () => {
+      const base = new Y.Doc({ gc: false })
+      base.clientID = 1
+      base.get('text').insert(0, 'ab')
+
+      const prevDoc = new Y.Doc({ gc: false })
+      prevDoc.clientID = 2
+      Y.applyUpdate(prevDoc, Y.encodeStateAsUpdate(base))
+      // Fragment client 1's Item(1,0,'ab',len=2) in prevDoc into 'a'(len=1) + 'X' + 'b'(len=1)
+      prevDoc.get('text').insert(1, 'X')
+
+      const nextDoc = new Y.Doc({ gc: true })
+      nextDoc.clientID = 3
+      Y.applyUpdate(nextDoc, Y.encodeStateAsUpdate(base))
+      // Delete 'ab' as one contiguous ContentDeleted(len=2) in nextDoc
+      nextDoc.get('text').delete(0, 2)
+
+      const renderer = Y.createDiffRenderer(prevDoc, nextDoc)
+      try {
+        renderer.rejectChanges(Y.createID(1, 0), Y.createID(1, 0))
+        verifyDocInvariants(nextDoc, { expectNoPending: true, label: 'R-3:nextDoc' })
+        verifyDocInvariants(prevDoc, { expectNoPending: true, label: 'R-3:prevDoc' })
+        assertInvariant(
+          nextDoc.get('text').toString() === 'ab',
+          `R-3: rejecting deletion of "ab" lost content (got "${nextDoc.get('text').toString()}", expected "ab")`
+        )
+      } finally {
+        renderer.destroy()
+        base.destroy()
+        prevDoc.destroy()
+        nextDoc.destroy()
+      }
+    }
+  },
+  {
+    id: 'P-1',
+    title: 'mapItemGet & applyDelta modifyAttr ignore rendererMode===2 on past-state AttributionsRenderer',
+    targetPr: 'PR #5',
+    run: () => {
+      const doc = new Y.Doc({ gc: false })
+      doc.clientID = 1
+      const ymap = doc.get('map')
+      const pastChild = new Y.Node()
+      pastChild.insert(0, 'old')
+      ymap.setAttr('child', pastChild)
+      ymap.setAttr('k0', 'initial')
+
+      // Capture frozen past-state renderer BEFORE future writes
+      const pastCids = Y.createContentIdsFromDoc(doc, false)
+      const pastRenderer = Y.createAttributionsRenderer(Y.createContentMap(), { renderedContent: pastCids.inserts })
+
+      // Future writes (all have rendererMode === 2, completely invisible under pastRenderer)
+      ymap.setAttr('futureOnly', 'secret')
+      const futureNode = new Y.Node()
+      futureNode.insert(0, 'future')
+      ymap.setAttr('futureNode', futureNode)
+      const futureChild = new Y.Node()
+      futureChild.insert(0, 'new')
+      ymap.setAttr('child', futureChild)
+
+      try {
+        // 1. position-helpers mapItemGet must return null for keys ignored by pastRenderer (rendererMode===2)
+        const [rposFutureOnly, rposFutureNode, rposChild] = Y.createRelativePositionsFromDeltaPositions(
+          ymap,
+          [
+            dpos.create(['futureOnly'], 1),
+            dpos.create(['futureNode', 0], 1),
+            dpos.create(['child', 0], 1)
+          ],
+          { renderer: pastRenderer }
+        )
+        assertInvariant(
+          rposFutureOnly === null,
+          'P-1: mapItemGet resolved a RelativePosition for key "futureOnly" ignored by pastRenderer (mode===2)'
+        )
+        assertInvariant(
+          rposFutureNode === null,
+          'P-1: mapItemGet descended into "futureNode" ignored by pastRenderer (mode===2)'
+        )
+        const futureChildStart = futureChild._start
+        if (rposChild !== null && futureChildStart !== null) {
+          assertInvariant(
+            !Y.compareIDs(rposChild.item, futureChildStart.id),
+            'P-1: mapItemGet resolved overwritten key "child" to ignored futureChild instead of rendered pastChild'
+          )
+        }
+
+        // 2. applyDelta modifyAttr must NOT mutate a map child ignored by pastRenderer (rendererMode===2)
+        try {
+          ymap.applyDelta(
+            delta.create(delta.$deltaAny).modifyAttr('futureNode', delta.create(delta.$deltaAny).insert('X').done()).done(),
+            null,
+            { renderer: pastRenderer }
+          )
+        } catch (_err) {
+          // Rejecting modifyAttr on an unrendered key is valid; silent mutation is not
+        }
+        assertInvariant(
+          futureNode.toString() === 'future',
+          `P-1: applyDelta modifyAttr under pastRenderer mutated invisible futureNode to "${futureNode.toString()}"`
+        )
+      } finally {
+        pastRenderer.destroy()
+        doc.destroy()
+      }
+    }
+  },
+  {
+    id: 'P-3',
+    title: 'createRelativePositionsFromDeltaPositions calls root.get(step0), polluting doc.share with empty YNodes for nonexistent roots',
+    targetPr: 'PR #5',
+    run: () => {
+      const doc = new Y.Doc()
+      try {
+        doc.get('text').insert(0, 'hi')
+        assertInvariant(doc.share.size === 1, 'P-3: expected initial doc.share.size === 1')
+        const [rpos] = Y.createRelativePositionsFromDeltaPositions(
+          doc,
+          [dpos.create(['nonexistent_root', 0], 1)]
+        )
+        assertInvariant(
+          !doc.share.has('nonexistent_root') && doc.share.size === 1,
+          `P-3: createRelativePositionsFromDeltaPositions polluted doc.share (size=${doc.share.size}, has('nonexistent_root')=${doc.share.has('nonexistent_root')})`
+        )
+        assertInvariant(
+          rpos === null,
+          'P-3: expected null RelativePosition for nonexistent root key'
+        )
+      } finally {
+        doc.destroy()
+      }
+    }
+  },
+  {
+    id: 'BUG-ATTR-STALE-INSERT',
+    title: 'Deleting an attributed item under AttributionsRenderer leaves stale insert attribution in live .delta cache',
+    targetPr: 'PR #5',
+    run: () => {
+      // Case A: ContentString with insert attribution deleted under AttributionsRenderer
+      const docA = new Y.Doc({ gc: false })
+      docA.clientID = 1
+      const textA = docA.get('text')
+      textA.insert(0, 'hello')
+      const cmapA = Y.createContentMap()
+      cmapA.inserts.add(1, 0, 5, [Y.createContentAttribute('insert', 'alice')])
+      const rendA = Y.createAttributionsRenderer(cmapA)
+      textA.useRenderer(rendA)
+      const liveA = textA.delta
+
+      // Case B: ContentAny array with insert attribution on leading element deleted under AttributionsRenderer
+      const docB = new Y.Doc({ gc: false })
+      docB.clientID = 2
+      const arrB = docB.get('array')
+      arrB.insert(0, [10, 20, 30, 40])
+      const cmapB = Y.createContentMap()
+      cmapB.inserts.add(2, 0, 1, [Y.createContentAttribute('insert', 'bob')])
+      const rendB = Y.createAttributionsRenderer(cmapB)
+      arrB.useRenderer(rendB)
+      const liveB = arrB.delta
+
+      // Case C: cmap.deletes-only attribution (empty insert:[] while alive, delete:['carol'] once deleted)
+      const docC = new Y.Doc({ gc: false })
+      docC.clientID = 3
+      const textC = docC.get('text')
+      textC.insert(0, 'abc')
+      const cmapC = Y.createContentMap()
+      cmapC.deletes.add(3, 0, 3, [Y.createContentAttribute('delete', 'carol')])
+      const rendC = Y.createAttributionsRenderer(cmapC)
+      textC.useRenderer(rendC)
+      const liveC = textC.delta
+
+      try {
+        textA.delete(0, 5)
+        const freshA = textA.toDeltaDeep()
+        assertInvariant(
+          liveA.equals(freshA),
+          `BUG-ATTR-STALE-INSERT(A): ContentString live .delta retained stale insert attribution!\n  live:  ${JSON.stringify(liveA.toJSON())}\n  fresh: ${JSON.stringify(freshA.toJSON())}`
+        )
+
+        arrB.delete(0, 3)
+        const freshB = arrB.toDeltaDeep()
+        assertInvariant(
+          liveB.equals(freshB),
+          `BUG-ATTR-STALE-INSERT(B): ContentAny live .delta retained stale insert attribution!\n  live:  ${JSON.stringify(liveB.toJSON())}\n  fresh: ${JSON.stringify(freshB.toJSON())}`
+        )
+
+        textC.delete(0, 3)
+        const freshC = textC.toDeltaDeep()
+        assertInvariant(
+          liveC.equals(freshC),
+          `BUG-ATTR-STALE-INSERT(C): deletes-only live .delta retained stale empty insert:[] attribution!\n  live:  ${JSON.stringify(liveC.toJSON())}\n  fresh: ${JSON.stringify(freshC.toJSON())}`
+        )
+      } finally {
+        rendA.destroy()
+        rendB.destroy()
+        rendC.destroy()
+        docA.destroy()
+        docB.destroy()
+        docC.destroy()
+      }
+    }
+  },
+  {
+    id: 'BUG-LAMPORT-CAUSALITY',
+    title: 'V1 update with impossible same-client future/self origin reference must be rejected atomically without corrupting doc',
+    targetPr: 'PR #2',
+    run: () => {
+      const doc = new Y.Doc({ gc: false })
+      doc.clientID = 1
+      doc.get('text').insert(0, 'seed')
+      doc.get('map').setAttr('k1', 'orig')
+
+      const beforeV1 = Y.encodeStateAsUpdate(doc)
+      const beforeSV = Y.encodeStateVector(doc)
+
+      // Payload 1: Client 10 Item(10,0,len=2,origin=ID(10,2)) referencing future map Item(10,2,parent='map',parentSub='k1')
+      const encFutureOrigin = encoding.createEncoder()
+      encoding.writeVarUint(encFutureOrigin, 1) // 1 client
+      encoding.writeVarUint(encFutureOrigin, 2) // 2 structs
+      encoding.writeVarUint(encFutureOrigin, 10) // client=10
+      encoding.writeVarUint(encFutureOrigin, 0) // start clock=0
+      // Struct 1: Item(10,0,len=2,origin=ID(10,2),ContentString('ab'))
+      encoding.writeUint8(encFutureOrigin, 4 | 0x80)
+      encoding.writeVarUint(encFutureOrigin, 10)
+      encoding.writeVarUint(encFutureOrigin, 2)
+      encoding.writeVarString(encFutureOrigin, 'ab')
+      // Struct 2: Item(10,2,len=1,parent='map',parentSub='k1',ContentAny(['val']))
+      encoding.writeUint8(encFutureOrigin, 8 | 0x20)
+      encoding.writeVarUint(encFutureOrigin, 1) // parentInfo = ykey string
+      encoding.writeVarString(encFutureOrigin, 'map')
+      encoding.writeVarString(encFutureOrigin, 'k1')
+      encoding.writeVarUint(encFutureOrigin, 1) // ContentAny len=1
+      encoding.writeAny(encFutureOrigin, 'val')
+      encoding.writeVarUint(encFutureOrigin, 0) // empty deleteSet
+      const payloadFutureOrigin = encoding.toUint8Array(encFutureOrigin)
+
+      // Payload 2: Client 11 self-referencing origin Item(11,0,len=1,origin=ID(11,0))
+      const encSelfOrigin = encoding.createEncoder()
+      encoding.writeVarUint(encSelfOrigin, 1)
+      encoding.writeVarUint(encSelfOrigin, 1)
+      encoding.writeVarUint(encSelfOrigin, 11)
+      encoding.writeVarUint(encSelfOrigin, 0)
+      encoding.writeUint8(encSelfOrigin, 4 | 0x80)
+      encoding.writeVarUint(encSelfOrigin, 11)
+      encoding.writeVarUint(encSelfOrigin, 0)
+      encoding.writeVarString(encSelfOrigin, 'x')
+      encoding.writeVarUint(encSelfOrigin, 0)
+      const payloadSelfOrigin = encoding.toUint8Array(encSelfOrigin)
+
+      // Payload 3: Client 12 future rightOrigin Item(12,0,len=1,rightOrigin=ID(12,1)) -> Item(12,1,parent='text')
+      const encFutureRight = encoding.createEncoder()
+      encoding.writeVarUint(encFutureRight, 1)
+      encoding.writeVarUint(encFutureRight, 2)
+      encoding.writeVarUint(encFutureRight, 12)
+      encoding.writeVarUint(encFutureRight, 0)
+      encoding.writeUint8(encFutureRight, 4 | 0x40) // BIT7 = hasRightOrigin
+      encoding.writeVarUint(encFutureRight, 12)
+      encoding.writeVarUint(encFutureRight, 1)
+      encoding.writeVarString(encFutureRight, 'a')
+      encoding.writeUint8(encFutureRight, 4) // origin=null, rightOrigin=null, parent='text'
+      encoding.writeVarUint(encFutureRight, 1)
+      encoding.writeVarString(encFutureRight, 'text')
+      encoding.writeVarString(encFutureRight, 'b')
+      encoding.writeVarUint(encFutureRight, 0)
+      const payloadFutureRight = encoding.toUint8Array(encFutureRight)
+
+      /** @type {Array<{ name: string, payload: Uint8Array }>} */
+      const cases = [
+        { name: 'same-client-future-origin-map', payload: payloadFutureOrigin },
+        { name: 'same-client-self-origin', payload: payloadSelfOrigin },
+        { name: 'same-client-future-rightOrigin', payload: payloadFutureRight }
+      ]
+
+      try {
+        for (let i = 0; i < cases.length; i++) {
+          const c = cases[i]
+          let threw = false
+          try {
+            Y.applyUpdate(doc, c.payload)
+          } catch (_err) {
+            threw = true
+          }
+          assertInvariant(
+            threw,
+            `BUG-LAMPORT-CAUSALITY(${c.name}): applyUpdate accepted impossible same-client forward/self causal reference without throwing!`
+          )
+          assertInvariant(
+            equalBytes(Y.encodeStateAsUpdate(doc), beforeV1) && equalBytes(Y.encodeStateVector(doc), beforeSV),
+            `BUG-LAMPORT-CAUSALITY(${c.name}): rejected update mutated doc state (atomicity violation)!`
+          )
+          verifyDocInvariants(doc, { expectNoPending: true, label: `BUG-LAMPORT-CAUSALITY:${c.name}` })
+        }
+      } finally {
+        doc.destroy()
+      }
+    }
+  },
+  {
+    id: 'BUG-RT-1',
+    title: 'insertContent mutates caller op.format in place, corrupting finalized Delta & throwing TypeError on frozen format objects',
+    targetPr: 'PR #5',
+    run: () => {
+      const doc = new Y.Doc({ gc: false })
+      doc.clientID = 1
+      const ytext = doc.get('text')
+      try {
+        ytext.insert(0, 'ab', { bold: true })
+
+        // 1. Applying a finalized (.done()) Delta inside a formatted run must NOT mutate its op.format in place
+        const d = delta.create().retain(1).insert('X', { italic: true }).done()
+        const beforeJson = JSON.stringify(d.toJSON())
+        const expected = delta.create().retain(1).insert('X', { italic: true }).done()
+        ytext.applyDelta(d)
+        const afterJson = JSON.stringify(d.toJSON())
+        assertInvariant(
+          afterJson === beforeJson && d.equals(expected),
+          `BUG-RT-1: applyDelta mutated caller's .done() Delta in place!\n  before: ${beforeJson}\n  after:  ${afterJson}`
+        )
+
+        // 2. Passing a frozen format object to insert() inside a formatted run must NOT throw TypeError
+        const frozenFmt = Object.freeze({ underline: true })
+        /** @type {unknown} */
+        let threwErr = null
+        try {
+          ytext.insert(1, 'Y', frozenFmt)
+        } catch (err) {
+          threwErr = err
+        }
+        assertInvariant(
+          threwErr === null,
+          `BUG-RT-1: ytext.insert() threw on Object.freeze({ underline: true }): ${String(threwErr)}`
+        )
+      } finally {
+        doc.destroy()
+      }
+    }
+  },
+  {
+    id: 'BUG-RT-2',
+    title: 'cleanupYTextFormatting passes live countable start into cleanupFormattingGap, skipping every gap after char 0',
+    targetPr: 'PR #5',
+    run: () => {
+      /**
+       * Count alive ContentFormat items in a YNode's linked list.
+       *
+       * @param {Y.Node} node
+       * @return {number}
+       */
+      const countAliveFormats = node => {
+        let count = 0
+        for (let item = node._start; item !== null; item = item.right) {
+          if (!item.deleted && item.content instanceof Y.ContentFormat) {
+            count++
+          }
+        }
+        return count
+      }
+
+      const d1 = new Y.Doc({ gc: false })
+      const d2 = new Y.Doc({ gc: false })
+      const d3 = new Y.Doc({ gc: false, isSuggestionDoc: true })
+      d1.clientID = 1
+      d2.clientID = 2
+      d3.clientID = 3
+      try {
+        d1.get('text').insert(0, 'abc')
+        const baseU = Y.encodeStateAsUpdate(d1)
+        Y.applyUpdate(d2, baseU)
+        Y.applyUpdate(d3, baseU)
+
+        // Concurrent identical bold formatting on char index 1 ('b') creates duplicate ContentFormat markers after 'a' and 'b'
+        d1.get('text').format(1, 1, { bold: true })
+        d2.get('text').format(1, 1, { bold: true })
+        const u1 = Y.encodeStateAsUpdate(d1)
+        const u2 = Y.encodeStateAsUpdate(d2)
+
+        // 1. Automatic cleanup during sync on d1 must remove the 2 redundant markers (4 -> 2)
+        Y.applyUpdate(d1, u2)
+        const aliveD1 = countAliveFormats(d1.get('text'))
+        assertInvariant(
+          aliveD1 === 2,
+          `BUG-RT-2: automatic formatting cleanup after sync left ${aliveD1} alive ContentFormat items (expected 2)`
+        )
+
+        // 2. Direct cleanupYTextFormatting call on d3 (which deferred cleanup during sync) must clean 2 redundant markers
+        Y.applyUpdate(d3, u1)
+        Y.applyUpdate(d3, u2)
+        const aliveBefore = countAliveFormats(d3.get('text'))
+        assertInvariant(aliveBefore === 4, `BUG-RT-2: expected 4 duplicate markers before manual cleanup, got ${aliveBefore}`)
+        d3.cleanupFormatting = true
+        const cleaned = Y.cleanupYTextFormatting(d3.get('text'))
+        const aliveAfter = countAliveFormats(d3.get('text'))
+        assertInvariant(
+          cleaned === 2 && aliveAfter === 2,
+          `BUG-RT-2: cleanupYTextFormatting cleaned ${cleaned} markers and left ${aliveAfter} alive (expected cleaned=2, alive=2)`
+        )
+      } finally {
+        d1.destroy()
+        d2.destroy()
+        d3.destroy()
+      }
+    }
+  },
+  {
+    id: 'BUG-RT-3',
+    title: 'cleanupFormattingGap compares format values with === instead of equalFormats, leaking redundant object-mark ContentFormat items',
+    targetPr: 'PR #5',
+    run: () => {
+      const doc = new Y.Doc({ gc: false })
+      doc.clientID = 1
+      const ytext = doc.get('text')
+      try {
+        ytext.insert(0, 'a', { link: { href: 'https://yjs.dev' } })
+        ytext.insert(1, 'b')
+        ytext.insert(2, 'c', { link: { href: 'https://yjs.dev' } })
+        // Deleting 'b' makes 'a' and 'c' adjacent with structurally identical object-valued link marks
+        ytext.delete(1, 1)
+
+        let aliveFormats = 0
+        for (let item = ytext._start; item !== null; item = item.right) {
+          if (!item.deleted && item.content instanceof Y.ContentFormat) {
+            aliveFormats++
+          }
+        }
+        assertInvariant(
+          aliveFormats === 2,
+          `BUG-RT-3: deleting 'b' between identical object-valued { link: { href } } runs left ${aliveFormats} alive ContentFormat items (expected 2)`
+        )
+      } finally {
+        doc.destroy()
+      }
+    }
+  },
+  {
+    id: 'BUG-828-SAFETY',
+    title: 'Concurrent identical format + anchored insert (#828) must remain commutative and preserve bold on inserted char Z',
+    targetPr: 'PR #5',
+    run: () => {
+      const expected = delta.create().insert('a').insert('Zb', { bold: true }).done()
+
+      // Order 1: A1 -> B first (triggers cleanupYTextAfterTransaction on B), then A2 -> B, then B <-> A
+      const a1 = new Y.Doc({ gc: false })
+      const b1 = new Y.Doc({ gc: false })
+      a1.clientID = 1
+      b1.clientID = 2
+
+      // Order 2: B1 -> A first, then A <-> B
+      const a2 = new Y.Doc({ gc: false })
+      const b2 = new Y.Doc({ gc: false })
+      a2.clientID = 1
+      b2.clientID = 2
+
+      try {
+        // Shared base 'ab' on both pairs
+        a1.get('text').insert(0, 'ab')
+        const baseU = Y.encodeStateAsUpdate(a1)
+        Y.applyUpdate(b1, baseU)
+        Y.applyUpdate(a2, baseU)
+        Y.applyUpdate(b2, baseU)
+
+        // Pair 1 offline ops
+        const svA1Base = Y.encodeStateVector(a1)
+        a1.get('text').format(1, 1, { bold: true }) // Tx A1: creates CF_A1(bold:true) before 'b'
+        const uA1 = Y.encodeStateAsUpdate(a1, svA1Base)
+        const svA1After = Y.encodeStateVector(a1)
+        a1.get('text').insert(1, 'Z', { bold: true }) // Tx A2: anchors 'Z' at origin = CF_A1
+        const uA2 = Y.encodeStateAsUpdate(a1, svA1After)
+
+        b1.get('text').format(1, 1, { bold: true }) // Tx B1: concurrent identical bold on 'b'
+
+        // Deliver A1 -> B1 first, then A2 -> B1, then full sync
+        Y.applyUpdate(b1, uA1)
+        Y.applyUpdate(b1, uA2)
+        Y.applyUpdate(a1, Y.encodeStateAsUpdate(b1, Y.encodeStateVector(a1)))
+        Y.applyUpdate(b1, Y.encodeStateAsUpdate(a1, Y.encodeStateVector(b1)))
+
+        // Pair 2 identical offline ops, reverse delivery order (B1 -> A2 first)
+        const svB2Base = Y.encodeStateVector(b2)
+        b2.get('text').format(1, 1, { bold: true }) // Tx B1
+        const uB2 = Y.encodeStateAsUpdate(b2, svB2Base)
+        a2.get('text').format(1, 1, { bold: true }) // Tx A1
+        a2.get('text').insert(1, 'Z', { bold: true }) // Tx A2
+
+        Y.applyUpdate(a2, uB2)
+        Y.applyUpdate(b2, Y.encodeStateAsUpdate(a2, Y.encodeStateVector(b2)))
+        Y.applyUpdate(a2, Y.encodeStateAsUpdate(b2, Y.encodeStateVector(a2)))
+
+        const dA1 = a1.get('text').toDeltaDeep()
+        const dB1 = b1.get('text').toDeltaDeep()
+        const dA2 = a2.get('text').toDeltaDeep()
+        const dB2 = b2.get('text').toDeltaDeep()
+
+        assertInvariant(
+          dA1.equals(expected) && dB1.equals(expected),
+          `BUG-828-SAFETY(Order1): Z lost bold formatting!\n  A1: ${JSON.stringify(dA1.toJSON())}\n  B1: ${JSON.stringify(dB1.toJSON())}\n  exp:${JSON.stringify(expected.toJSON())}`
+        )
+        assertInvariant(
+          dA2.equals(expected) && dB2.equals(expected),
+          `BUG-828-SAFETY(Order2): reverse delivery order diverged!\n  A2: ${JSON.stringify(dA2.toJSON())}\n  B2: ${JSON.stringify(dB2.toJSON())}`
+        )
+        assertInvariant(
+          dA1.equals(dA2) && dB1.equals(dB2),
+          'BUG-828-SAFETY: Order 1 and Order 2 failed to commute identically!'
+        )
+      } finally {
+        a1.destroy()
+        b1.destroy()
+        a2.destroy()
+        b2.destroy()
+      }
+    }
+  },
+  {
+    id: 'BUG-SKIP-WRITE',
+    title: 'Skip.prototype.write ignores offsetEnd, shifting subsequent struct clocks when slicing a Skip',
+    targetPr: 'PR #5',
+    run: () => {
+      const src = new Y.Doc({ gc: false })
+      const partial = new Y.Doc({ gc: false })
+      src.clientID = 1
+      try {
+        // Build Item(1, 0, len=1), clocks 1..10 gap, Item(1, 11, len=1) with origin=null so it integrates ahead of gap
+        src.get('text').insert(0, 'a')
+        const u0 = Y.encodeStateAsUpdate(src)
+        src.get('text').insert(1, '0123456789')
+        const sv11 = Y.encodeStateVector(src)
+        src.get('other').insert(0, 'z')
+        const u11 = Y.encodeStateAsUpdate(src, sv11)
+
+        // partial.store now holds [Item(1,0,1), Skip(1,1,10), Item(1,11,1)]
+        Y.applyUpdate(partial, u0)
+        Y.applyUpdate(partial, u11)
+        const partialV1 = Y.encodeStateAsUpdate(partial)
+        const partialV2 = Y.encodeStateAsUpdateV2(partial)
+
+        // Slice [0, 5) U [11, 12) -> hits Skip(1,1,10) with offset=0, offsetEnd=6 in writeStructs (encoding-helpers.js:65)!
+        const inserts = Y.createIdSet()
+        inserts.add(1, 0, 5)
+        inserts.add(1, 11, 1)
+
+        // 1. Direct writeStructsFromIdSet V1 & V2 (exercises Skip.prototype.write with offsetEnd=6 directly)
+        const encV1 = new Y.UpdateEncoderV1()
+        writeStructsFromIdSet(encV1, partial.store, inserts)
+        Y.writeIdSet(encV1, Y.createIdSet())
+        const rawV1 = encV1.toUint8Array()
+        const rawItemsV1 = Y.decodeUpdate(rawV1).structs.filter(s => s instanceof Y.Item && s.id.client === 1)
+        assertInvariant(
+          rawItemsV1.length === 2 && rawItemsV1[1].id.clock === 11,
+          `BUG-SKIP-WRITE(writeStructs V1): second Item clock corrupted to ${rawItemsV1.length >= 2 ? String(rawItemsV1[1].id.clock) : 'missing'} (expected 11)`
+        )
+
+        const encV2 = new Y.UpdateEncoderV2()
+        writeStructsFromIdSet(encV2, partial.store, inserts)
+        Y.writeIdSet(encV2, Y.createIdSet())
+        const rawV2 = encV2.toUint8Array()
+        const rawItemsV2 = Y.decodeUpdateV2(rawV2).structs.filter(s => s instanceof Y.Item && s.id.client === 1)
+        assertInvariant(
+          rawItemsV2.length === 2 && rawItemsV2[1].id.clock === 11,
+          `BUG-SKIP-WRITE(writeStructs V2): second Item clock corrupted to ${rawItemsV2.length >= 2 ? String(rawItemsV2[1].id.clock) : 'missing'} (expected 11)`
+        )
+
+        // 2. Also confirm intersectUpdateWithContentIds V1 & V2 preserve exact Item clocks
+        const cids = Y.createContentIds(inserts, Y.createIdSet())
+        const itemsV1 = Y.decodeUpdate(Y.intersectUpdateWithContentIds(partialV1, cids)).structs.filter(s => s instanceof Y.Item && s.id.client === 1)
+        const itemsV2 = Y.decodeUpdateV2(Y.intersectUpdateWithContentIdsV2(partialV2, cids)).structs.filter(s => s instanceof Y.Item && s.id.client === 1)
+        assertInvariant(
+          itemsV1.length === 2 && itemsV1[1].id.clock === 11,
+          `BUG-SKIP-WRITE(intersect V1): second Item clock corrupted to ${itemsV1.length >= 2 ? String(itemsV1[1].id.clock) : 'missing'} (expected 11)`
+        )
+        assertInvariant(
+          itemsV2.length === 2 && itemsV2[1].id.clock === 11,
+          `BUG-SKIP-WRITE(intersect V2): second Item clock corrupted to ${itemsV2.length >= 2 ? String(itemsV2[1].id.clock) : 'missing'} (expected 11)`
+        )
+      } finally {
+        src.destroy()
+        partial.destroy()
+      }
+    }
+  },
+  {
+    id: 'BUG-SV-SKIP0',
+    title: 'encodeStateVectorFromUpdate(V1/V2) hallucinates clock=len when first client starts with Skip(client, 0, len)',
+    targetPr: 'PR #5',
+    run: () => {
+      const src = new Y.Doc({ gc: false })
+      const partial = new Y.Doc({ gc: false })
+      src.clientID = 7
+      try {
+        src.get('text').insert(0, '01234') // clocks 0..5
+        const sv5 = Y.encodeStateVector(src)
+        src.get('other').insert(0, 'hi') // clocks 5..7, origin=null -> integrates with Skip(7, 0, 5)
+        const uTail = Y.encodeStateAsUpdate(src, sv5)
+
+        Y.applyUpdate(partial, uTail)
+        const trueSv = Y.decodeStateVector(Y.encodeStateVector(partial))
+        assertInvariant((trueSv.get(7) ?? 0) === 0, `BUG-SV-SKIP0: setup expected true SV(7)=0, got ${String(trueSv.get(7))}`)
+
+        const uV1 = Y.encodeStateAsUpdate(partial)
+        const uV2 = Y.encodeStateAsUpdateV2(partial)
+        const svFromV1 = Y.decodeStateVector(Y.encodeStateVectorFromUpdate(uV1))
+        const svFromV2 = Y.decodeStateVector(Y.encodeStateVectorFromUpdateV2(uV2))
+
+        assertInvariant(
+          (svFromV1.get(7) ?? 0) === 0,
+          `BUG-SV-SKIP0(V1): encodeStateVectorFromUpdate hallucinated client 7 clock=${String(svFromV1.get(7))} (expected 0)`
+        )
+        assertInvariant(
+          (svFromV2.get(7) ?? 0) === 0,
+          `BUG-SV-SKIP0(V2): encodeStateVectorFromUpdateV2 hallucinated client 7 clock=${String(svFromV2.get(7))} (expected 0)`
+        )
+      } finally {
+        src.destroy()
+        partial.destroy()
+      }
+    }
+  },
+  {
+    id: 'BUG-BLOCKSET-LEADSKIP',
+    title: 'BlockSet.insertInto slow path emits spurious leading Skip(client, 0, ...) when result is empty',
+    targetPr: 'PR #5',
+    run: () => {
+      const src = new Y.Doc({ gc: false })
+      const docA = new Y.Doc({ gc: false })
+      const docB = new Y.Doc({ gc: false })
+      src.clientID = 7
+      try {
+        src.get('t0').insert(0, '012') // clocks 0..3
+        const sv3 = Y.encodeStateVector(src)
+        src.get('t1').insert(0, 'ab') // clocks 3..5
+        const tailA = Y.encodeStateAsUpdate(src, sv3)
+        const sv5 = Y.encodeStateVector(src)
+        src.get('t2').insert(0, 'cd') // clocks 5..7
+        const tailB = Y.encodeStateAsUpdate(src, sv5)
+
+        // docA -> [Skip(7,0,3), Item(7,3,2)], docB -> [Skip(7,0,5), Item(7,5,2)]
+        Y.applyUpdate(docA, tailA)
+        Y.applyUpdate(docB, tailB)
+
+        const uAv1 = Y.encodeStateAsUpdate(docA)
+        const uBv1 = Y.encodeStateAsUpdate(docB)
+        const uAv2 = Y.encodeStateAsUpdateV2(docA)
+        const uBv2 = Y.encodeStateAsUpdateV2(docB)
+
+        // Both orders hit BlockSet.insertInto slow path: [uA, uB] hits L302, [uB, uA] hits L285
+        const mergedV1Cases = [
+          { name: 'V1(A,B)', u: Y.mergeUpdates([uAv1, uBv1]) },
+          { name: 'V1(B,A)', u: Y.mergeUpdates([uBv1, uAv1]) }
+        ]
+        for (let i = 0; i < mergedV1Cases.length; i++) {
+          const c = mergedV1Cases[i]
+          const dec = Y.decodeUpdate(c.u)
+          assertInvariant(
+            dec.structs.length > 0 && !(dec.structs[0] instanceof Y.Skip) && dec.structs[0].id.clock === 3,
+            `BUG-BLOCKSET-LEADSKIP(${c.name}): first struct was ${dec.structs[0] ? `${dec.structs[0].constructor.name}@${dec.structs[0].id.clock}` : 'none'} (expected Item@3, no leading Skip)`
+          )
+          const sv = Y.decodeStateVector(Y.encodeStateVectorFromUpdate(c.u))
+          assertInvariant(
+            (sv.get(7) ?? 0) === 0,
+            `BUG-BLOCKSET-LEADSKIP(${c.name}): encodeStateVectorFromUpdate reported client 7 clock=${String(sv.get(7))} (expected 0)`
+          )
+        }
+
+        const mergedV2Cases = [
+          { name: 'V2(A,B)', u: Y.mergeUpdatesV2([uAv2, uBv2]) },
+          { name: 'V2(B,A)', u: Y.mergeUpdatesV2([uBv2, uAv2]) }
+        ]
+        for (let i = 0; i < mergedV2Cases.length; i++) {
+          const c = mergedV2Cases[i]
+          const dec = Y.decodeUpdateV2(c.u)
+          assertInvariant(
+            dec.structs.length > 0 && !(dec.structs[0] instanceof Y.Skip) && dec.structs[0].id.clock === 3,
+            `BUG-BLOCKSET-LEADSKIP(${c.name}): first struct was ${dec.structs[0] ? `${dec.structs[0].constructor.name}@${dec.structs[0].id.clock}` : 'none'} (expected Item@3, no leading Skip)`
+          )
+          const sv = Y.decodeStateVector(Y.encodeStateVectorFromUpdateV2(c.u))
+          assertInvariant(
+            (sv.get(7) ?? 0) === 0,
+            `BUG-BLOCKSET-LEADSKIP(${c.name}): encodeStateVectorFromUpdateV2 reported client 7 clock=${String(sv.get(7))} (expected 0)`
+          )
+        }
+      } finally {
+        src.destroy()
+        docA.destroy()
+        docB.destroy()
+      }
+    }
+  },
+  {
+    id: 'ID-COPY-2',
+    title: 'mergeIdSets & diffIdSet alias input IdRange with _lastIsUsed=false so subsequent .add() silently mutates inputs',
+    targetPr: 'PR #5',
+    run: () => {
+      // Part A: mergeIdSets([a]) + m.add(1, 5, 3) must NOT mutate input a from [0,5) to [0,8)
+      const a = Y.createIdSet()
+      a.add(1, 0, 5)
+      const m = Y.mergeIdSets([a])
+      m.add(1, 5, 3)
+      assertInvariant(
+        !a.has(1, 5) && !a.has(1, 7),
+        `ID-COPY-2(mergeIdSets): m.add(1, 5, 3) silently mutated input IdSet a (a.has(1,5)=${a.has(1, 5)}, a.has(1,7)=${a.has(1, 7)})`
+      )
+
+      // Part B: diffIdSet(a2, empty) + d.add(1, 5, 3) must NOT mutate input a2 from [0,5) to [0,8)
+      const a2 = Y.createIdSet()
+      a2.add(1, 0, 5)
+      const d = Y.diffIdSet(a2, Y.createIdSet())
+      d.add(1, 5, 3)
+      assertInvariant(
+        !a2.has(1, 5) && !a2.has(1, 7),
+        `ID-COPY-2(diffIdSet): d.add(1, 5, 3) silently mutated input IdSet a2 (a2.has(1,5)=${a2.has(1, 5)}, a2.has(1,7)=${a2.has(1, 7)})`
+      )
+    }
+  },
+  {
+    id: 'BUG-IDMAP-INSERT',
+    title: 'insertIntoIdMap installs IdRanges from IdSet (erasing later attrs) and skips _ensureAttrs (duplicating equal attrs)',
+    targetPr: 'PR #5',
+    run: () => {
+      // Part A: insertIntoIdMap(dest, idSet) installs IdRanges instead of AttrRanges, silently dropping later attrs
+      const dest = Y.createIdMap()
+      const idSet = Y.createIdSet()
+      idSet.add(1, 0, 5)
+      Y.insertIntoIdMap(dest, idSet)
+      dest.add(1, 0, 5, [Y.createContentAttribute('insert', 'alice')])
+      const slicedA = dest.slice(1, 0, 5)
+      const hasAlice = slicedA.length > 0 && slicedA.every(r => r.attrs !== null && r.attrs.some(a => a.name === 'insert' && a.val === 'alice'))
+      assertInvariant(
+        hasAlice,
+        `BUG-IDMAP-INSERT(A1): insertIntoIdMap(dest, idSet) installed IdRanges causing dest.add() to silently erase 'alice' (slice=${JSON.stringify(slicedA)})`
+      )
+      const dest2 = Y.createIdMap()
+      Y.insertIntoIdMap(dest2, idSet)
+      const otherMap = Y.createIdMap()
+      otherMap.add(1, 0, 5, [Y.createContentAttribute('insert', 'bob')])
+      Y.insertIntoIdMap(dest2, otherMap)
+      const slicedA2 = dest2.slice(1, 0, 5)
+      const hasBob = slicedA2.length > 0 && slicedA2.every(r => r.attrs !== null && r.attrs.some(a => a.name === 'insert' && a.val === 'bob'))
+      assertInvariant(
+        hasBob,
+        `BUG-IDMAP-INSERT(A2): insertIntoIdMap(dest2, idSet) followed by insertIntoIdMap(dest2, otherMap) silently erased 'bob' (slice=${JSON.stringify(slicedA2)})`
+      )
+
+      // Part B: insertIntoIdMap(mapA, mapB) skips _ensureAttrs, duplicating equal-value ContentAttribute instances
+      const mapA = Y.createIdMap()
+      mapA.add(1, 0, 5, [Y.createContentAttribute('insert', 'alice')])
+      const mapB = Y.createIdMap()
+      mapB.add(1, 0, 5, [Y.createContentAttribute('insert', 'alice')])
+      Y.insertIntoIdMap(mapA, mapB)
+      const rangesB = mapA.clients.get(1)?.getIds() ?? []
+      assertInvariant(
+        rangesB.length === 1 && rangesB[0].attrs.length === 1,
+        `BUG-IDMAP-INSERT(B): insertIntoIdMap(mapA, mapB) accumulated duplicate equal attrs (attrs.length=${rangesB[0] ? rangesB[0].attrs.length : 0}, expected 1)`
+      )
+      assertInvariant(
+        mapA.attrs.size === 1,
+        `BUG-IDMAP-INSERT(B): expected mapA.attrs.size === 1, got ${mapA.attrs.size}`
+      )
+    }
+  },
+  {
+    id: 'BUG-IDMAP-INTERSECT',
+    title: 'intersectMaps duplicates equal attrs & leaves attrs.size=0; diffIdMap aliases src.attrs/attrsH',
+    targetPr: 'PR #5',
+    run: () => {
+      // Part A: intersectMaps(a, b) with equal ContentAttributes duplicates attrs and leaves c.attrs empty
+      const a = Y.createIdMap()
+      a.add(1, 0, 5, [Y.createContentAttribute('insert', 'alice')])
+      const b = Y.createIdMap()
+      b.add(1, 0, 5, [Y.createContentAttribute('insert', 'alice')])
+      const c = Y.intersectMaps(a, b)
+      const ranges = c.clients.get(1)?.getIds() ?? []
+      assertInvariant(
+        ranges.length === 1 && ranges[0].attrs.length === 1,
+        `BUG-IDMAP-INTERSECT(A): intersectMaps produced duplicate attrs (attrs.length=${ranges[0] ? ranges[0].attrs.length : 0}, expected 1)`
+      )
+      assertInvariant(
+        c.attrs.size === 1,
+        `BUG-IDMAP-INTERSECT(A): intersectMaps left c.attrs.size=${c.attrs.size} (expected 1)`
+      )
+
+      // Part B: diffIdMap(src, empty) directly aliases src.attrs & src.attrsH so mutating diffed mutates src
+      const src = Y.createIdMap()
+      src.add(1, 0, 5, [Y.createContentAttribute('insert', 'alice')])
+      const diffed = Y.diffIdMap(src, Y.createIdSet())
+      diffed.add(1, 0, 1, [Y.createContentAttribute('insert', 'bob')])
+      assertInvariant(
+        src.attrs.size === 1 && src.attrsH.size === 1,
+        `BUG-IDMAP-INTERSECT(B): diffIdMap aliased src.attrs/attrsH — diffed.add() mutated src (attrs.size=${src.attrs.size}, attrsH.size=${src.attrsH.size}, expected 1)`
+      )
     }
   }
 ]
