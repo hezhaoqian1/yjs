@@ -425,6 +425,13 @@ const cleanupTransactions = (transactionCleanups, startIndex) => {
 }
 
 /**
+ * Internal non-null origin used by automatic post-transaction formatting cleanups so that
+ * `UndoManager` (which defaults to tracking `null`) does not capture remote cleanups into
+ * `undoStack` or wipe `redoStack`, while network providers still broadcast cleanup deletes.
+ */
+const formatCleanupOrigin = Symbol('yjs-format-cleanup')
+
+/**
  * This will be called by the transaction once the event handlers are called to potentially cleanup
  * formats.
  *
@@ -465,7 +472,7 @@ export const cleanupYTextAfterTransaction = transaction => {
     for (const yText of needFullCleanup) {
       cleanupYTextFormatting(yText)
     }
-  })
+  }, formatCleanupOrigin)
 }
 
 /**
