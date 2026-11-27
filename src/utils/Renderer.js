@@ -3,7 +3,7 @@ import * as encoding from 'lib0/encoding'
 
 import { getItemCleanStart } from './transaction-helpers.js'
 import { diffIdSet, createInsertSetFromStructStore, createDeleteSetFromStructStore, insertIntoIdSet, mergeIdSets, intersectSets, createIdSet, createIdSetFromIdMap, writeIdSet, createIdMapFromIdSet, insertIntoIdMap, diffIdMap, mergeIdMaps, intersectMaps, createMaybeAttrRange } from './ids.js'
-import { ContentDeleted, ContentFormat, ContentType } from '../structs/Item.js'
+import { ContentDeleted, ContentFormat, ContentType, Item } from '../structs/Item.js'
 import { createID } from './ID.js'
 import { writeStructsFromIdSet } from './encoding-helpers.js'
 import { applyUpdate, encodeStateAsUpdate } from './encoding.js'
@@ -562,8 +562,14 @@ export class DiffRenderer extends ObservableV2 {
         if ((!shouldRender && s.attrs == null) || this.inserts.has(client, s.clock)) {
           continue
         }
-        // Retrieved item is never more fragmented than the newer item.
-        const prevItem = this._prevDocStore.getItem(createID(client, s.clock))
+        // Guard against prevDoc missing/skipped/GC'd items before reading content.
+        if (s.clock >= this._prevDocStore.getClock(client) || this._prevDocStore.skips.has(client, s.clock)) {
+          continue
+        }
+        const prevItem = this._prevDocStore.get(createID(client, s.clock))
+        if (!(prevItem instanceof Item) || prevItem.content instanceof ContentDeleted) {
+          continue
+        }
         const diffStart = s.clock - prevItem.id.clock
         content = prevItem.length > 1 ? prevItem.content.copy() : prevItem.content
         // trim itemContent to the correct size.
@@ -573,11 +579,12 @@ export class DiffRenderer extends ObservableV2 {
       }
       const c = /** @type {AbstractContent} */ (content)
       const clen = c.getLength()
-      if (clen < s.len) {
-        slice.splice(i + 1, 0, createMaybeAttrRange(s.clock + clen, s.len - clen, s.attrs))
-        s.len = clen
+      let slen = s.len
+      if (clen < slen) {
+        slice.splice(i + 1, 0, createMaybeAttrRange(s.clock + clen, slen - clen, s.attrs))
+        slen = clen
       }
-      content = s.len < clen ? c.splice(s.len) : null
+      content = slen < clen ? c.splice(slen) : null
       // mode 3 (fresh content deleted in the same transaction) renders as an insert only where
       // the renderer attributes it — unattributed deleted content is invisible and renders as
       // *nothing* (there is nothing to insert, and a `delete` op would misapply: the consuming
