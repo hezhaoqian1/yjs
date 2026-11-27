@@ -2026,6 +2026,176 @@ export const REPRODUCERS = [
         doc.destroy()
       }
     }
+  },
+  {
+    id: 'BUG-DELTA-MODIFYATTR-FRESH-NODE',
+    title: 'nodeMapGetDelta emits modifyAttr instead of setAttr when a freshly inserted YNode attr is also populated in the same tx/diff',
+    targetPr: 'PR #5',
+    run: () => {
+      const doc1 = new Y.Doc({ gc: false })
+      doc1.clientID = 1
+      const doc2 = new Y.Doc({ gc: false })
+      doc2.clientID = 2
+      const v1 = new Y.Doc({ gc: false })
+      v1.clientID = 10
+      /** @type {Y.Doc | null} */
+      let v2 = null
+      const peerScalar = new Y.Doc({ gc: false })
+      peerScalar.clientID = 11
+      try {
+        // Part A: Overwrite existing YNode attr ('OLD') with fresh populated YNode ('NEW') in 1 remote update
+        const oldChild = new Y.Node('box')
+        oldChild.insert(0, 'OLD')
+        doc1.get('root').setAttr('k', oldChild)
+        Y.applyUpdate(doc2, Y.encodeStateAsUpdate(doc1))
+
+        const root2 = doc2.get('root')
+        const live2 = root2.delta
+        const rep2 = delta.create(delta.$deltaAny)
+        rep2.isFinal = true
+        rep2.apply(root2.toDeltaDeep())
+        root2.on('delta', d => { rep2.apply(d) })
+
+        const svBeforeA = Y.encodeStateVector(doc1)
+        doc1.transact(() => {
+          const newChild = new Y.Node('box')
+          doc1.get('root').setAttr('k', newChild)
+          newChild.insert(0, 'NEW')
+        })
+        const updA = Y.encodeStateAsUpdate(doc1, svBeforeA)
+        Y.applyUpdate(doc2, updA)
+
+        const freshA = root2.toDeltaDeep()
+        const cmpLiveA = deepEqualValues(live2.toJSON(), freshA.toJSON(), 'BUG-DELTA-MODIFYATTR-FRESH-NODE(A).live')
+        const cmpRepA = deepEqualValues(rep2.toJSON(), freshA.toJSON(), 'BUG-DELTA-MODIFYATTR-FRESH-NODE(A).rep')
+        assertInvariant(
+          live2.equals(freshA) && cmpLiveA.equal,
+          `BUG-DELTA-MODIFYATTR-FRESH-NODE(A): live .delta corrupted overwritten YNode attr (${cmpLiveA.reason ?? 'equals=false'})\n  live:  ${JSON.stringify(live2.toJSON())}\n  fresh: ${JSON.stringify(freshA.toJSON())}`
+        )
+        assertInvariant(
+          rep2.equals(freshA) && cmpRepA.equal,
+          `BUG-DELTA-MODIFYATTR-FRESH-NODE(A): replayed 'delta' corrupted overwritten YNode attr (${cmpRepA.reason ?? 'equals=false'})`
+        )
+
+        // A2: diffDocsToDelta (computeModifiedFromItems) overwriting existing YNode ('OLD') with fresh populated YNode ('NEW')
+        const snapOld = new Y.Doc({ gc: false })
+        try {
+          Y.applyUpdate(snapOld, Y.encodeStateAsUpdate(doc1))
+          const snapNew = Y.cloneDoc(snapOld, { gc: false })
+          try {
+            snapNew.clientID = 3
+            snapNew.transact(() => {
+              const repNode = new Y.Node('box')
+              snapNew.get('root').setAttr('k', repNode)
+              repNode.insert(0, 'REPLACED')
+            })
+            const diffReplace = Y.diffDocsToDelta(snapOld, snapNew, { renderer: null })
+            const rootReplaceOp = diffReplace.attrs.root
+            assertInvariant(
+              delta.$modifyAttrOp.check(rootReplaceOp) && delta.$setAttrOp.check(rootReplaceOp.value.attrs.k),
+              'BUG-DELTA-MODIFYATTR-FRESH-NODE(A2): diffDocsToDelta emitted modifyAttr instead of setAttr when replacing existing YNode attr'
+            )
+            if (delta.$modifyAttrOp.check(rootReplaceOp)) {
+              const appliedRep = delta.create(delta.$deltaAny)
+              appliedRep.isFinal = true
+              appliedRep.apply(snapOld.get('root').toDeltaDeep())
+              appliedRep.apply(rootReplaceOp.value)
+              const expRep = snapNew.get('root').toDeltaDeep()
+              assertInvariant(
+                appliedRep.equals(expRep),
+                `BUG-DELTA-MODIFYATTR-FRESH-NODE(A2): applying diffDocsToDelta corrupted replaced YNode attr\n  applied: ${JSON.stringify(appliedRep.toJSON())}\n  expect:  ${JSON.stringify(expRep.toJSON())}`
+              )
+            }
+          } finally {
+            snapNew.destroy()
+          }
+        } finally {
+          snapOld.destroy()
+        }
+
+        // Part B: Overwrite scalar attr (123) with fresh populated YNode ('HELLO') -> diffDocsToDelta & live peer
+        v1.get('root').setAttr('k', 123)
+        Y.applyUpdate(peerScalar, Y.encodeStateAsUpdate(v1))
+
+        const pRoot = peerScalar.get('root')
+        const liveScalar = pRoot.delta
+        const repScalar = delta.create(delta.$deltaAny)
+        repScalar.isFinal = true
+        repScalar.apply(pRoot.toDeltaDeep())
+        pRoot.on('delta', d => { repScalar.apply(d) })
+
+        v2 = Y.cloneDoc(v1, { gc: false })
+        v2.clientID = 12
+        const v2Doc = v2
+        const svBeforeB = Y.encodeStateVector(v2Doc)
+        v2Doc.transact(() => {
+          const freshNode = new Y.Node('box')
+          v2Doc.get('root').setAttr('k', freshNode)
+          freshNode.insert(0, 'HELLO')
+        })
+        const updB = Y.encodeStateAsUpdate(v2Doc, svBeforeB)
+
+        // B1. Attributed diffDocsToDelta(v1, v2) must emit setAttrOp (not modifyAttrOp) for 'k'
+        const diffAttr = Y.diffDocsToDelta(v1, v2)
+        const rootOpAttr = diffAttr.attrs.root
+        assertInvariant(
+          delta.$modifyAttrOp.check(rootOpAttr),
+          'BUG-DELTA-MODIFYATTR-FRESH-NODE(B1): expected modifyAttrOp for root share in diffDocsToDelta(v1, v2)'
+        )
+        if (delta.$modifyAttrOp.check(rootOpAttr)) {
+          const kOpAttr = rootOpAttr.value.attrs.k
+          assertInvariant(
+            delta.$setAttrOp.check(kOpAttr),
+            `BUG-DELTA-MODIFYATTR-FRESH-NODE(B1): diffDocsToDelta(v1, v2) emitted ${String(kOpAttr?.type)} instead of setAttrOp for fresh YNode attr`
+          )
+        }
+
+        // B2. Plain diffDocsToDelta(v1, v2, { renderer: null }) must emit setAttrOp AND apply cleanly onto v1
+        const diffPlain = Y.diffDocsToDelta(v1, v2, { renderer: null })
+        const rootOpPlain = diffPlain.attrs.root
+        assertInvariant(
+          delta.$modifyAttrOp.check(rootOpPlain),
+          'BUG-DELTA-MODIFYATTR-FRESH-NODE(B2): expected modifyAttrOp for root share in plain diffDocsToDelta'
+        )
+        if (delta.$modifyAttrOp.check(rootOpPlain)) {
+          const kOpPlain = rootOpPlain.value.attrs.k
+          assertInvariant(
+            delta.$setAttrOp.check(kOpPlain),
+            `BUG-DELTA-MODIFYATTR-FRESH-NODE(B2): plain diffDocsToDelta emitted ${String(kOpPlain?.type)} instead of setAttrOp for fresh YNode attr`
+          )
+          const appliedPlain = delta.create(delta.$deltaAny)
+          appliedPlain.isFinal = true
+          appliedPlain.apply(v1.get('root').toDeltaDeep())
+          appliedPlain.apply(rootOpPlain.value)
+          const expectedV2 = v2.get('root').toDeltaDeep()
+          const cmpApplied = deepEqualValues(appliedPlain.toJSON(), expectedV2.toJSON(), 'BUG-DELTA-MODIFYATTR-FRESH-NODE(B2).applied')
+          assertInvariant(
+            appliedPlain.equals(expectedV2) && cmpApplied.equal,
+            `BUG-DELTA-MODIFYATTR-FRESH-NODE(B2): applying plain diff onto v1 diverged from v2 (${cmpApplied.reason ?? 'equals=false'})`
+          )
+        }
+
+        // B3. Live peer overwriting scalar 123 with fresh populated YNode via single update
+        Y.applyUpdate(peerScalar, updB)
+        const freshB = pRoot.toDeltaDeep()
+        const cmpLiveB = deepEqualValues(liveScalar.toJSON(), freshB.toJSON(), 'BUG-DELTA-MODIFYATTR-FRESH-NODE(B3).live')
+        const cmpRepB = deepEqualValues(repScalar.toJSON(), freshB.toJSON(), 'BUG-DELTA-MODIFYATTR-FRESH-NODE(B3).rep')
+        assertInvariant(
+          liveScalar.equals(freshB) && cmpLiveB.equal,
+          `BUG-DELTA-MODIFYATTR-FRESH-NODE(B3): live .delta drifted when scalar attr was replaced by fresh YNode (${cmpLiveB.reason ?? 'equals=false'})\n  live:  ${JSON.stringify(liveScalar.toJSON())}\n  fresh: ${JSON.stringify(freshB.toJSON())}`
+        )
+        assertInvariant(
+          repScalar.equals(freshB) && cmpRepB.equal,
+          `BUG-DELTA-MODIFYATTR-FRESH-NODE(B3): replayed 'delta' drifted when scalar attr was replaced by fresh YNode (${cmpRepB.reason ?? 'equals=false'})`
+        )
+      } finally {
+        peerScalar.destroy()
+        v2?.destroy()
+        v1.destroy()
+        doc2.destroy()
+        doc1.destroy()
+      }
+    }
   }
 ]
 

@@ -2926,6 +2926,7 @@ export const nodeMapGetDelta = (d, parent, attrsToRender, renderer, deep, modifi
     const { deleted, attrs, content } = lrc
     const attribution = createAttributionFromAttributionItems(attrs, deleted)
     let c = array.last(content.getContent())
+    const isNewAttrItem = itemsToRender != null && itemsToRender.hasId(item.lastId) && !opts?.retainInserts
     if (deleted) {
       // A deleted write renders only under attribution (suggestion view / diff renderer, in a
       // full-state or an event-driven render). The attribute is still observable in the rendered
@@ -2943,7 +2944,7 @@ export const nodeMapGetDelta = (d, parent, attrsToRender, renderer, deep, modifi
         }
         d.setAttr(key, c, attribution)
       }
-    } else if (deep && c instanceof YNode && modified?.has(c)) {
+    } else if (deep && c instanceof YNode && modified?.has(c) && !isNewAttrItem) {
       // the attr item itself may be part of the change too (e.g. its insert-suggestion was accepted
       // along with its content): carry its attribution as the `modifyAttr` tri-state — merge when
       // present, clear (`null`) when gone, skip (`undefined`) when the item is not in the change
