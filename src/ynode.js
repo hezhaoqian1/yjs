@@ -18,6 +18,7 @@ import {
   ContentDeleted,
   ContentEmbed,
   ContentFormat,
+  createContentFormat,
   ContentJSON,
   ContentString,
   ContentType,
@@ -272,7 +273,7 @@ const insertNegatedFormats = (transaction, parent, currPos, negatedFormats) => {
   negatedFormats.forEach((val, key) => {
     const left = currPos.left
     const right = currPos.right
-    const nextFormat = new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, right, right && right.id, parent, null, new ContentFormat(key, val))
+    const nextFormat = new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, right, right && right.id, parent, null, createContentFormat(key, val))
     nextFormat.integrate(transaction, 0)
     currPos.right = nextFormat
     currPos.forward()
@@ -338,7 +339,7 @@ const insertFormats = (transaction, parent, currPos, formats) => {
       // save negated format (set null if currentVal undefined)
       negatedFormats.set(key, currentVal)
       const { left, right } = currPos
-      currPos.right = new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, right, right && right.id, parent, null, new ContentFormat(key, val))
+      currPos.right = new Item(createID(ownClientId, doc.store.getClock(ownClientId)), left, left && left.lastId, right, right && right.id, parent, null, createContentFormat(key, val))
       currPos.right.integrate(transaction, 0)
       currPos.forward()
     }
@@ -3048,7 +3049,7 @@ export const readContentJSON = decoder => {
  * @param {UpdateDecoderV1 | UpdateDecoderV2} decoder
  * @return {ContentFormat}
  */
-export const readContentFormat = decoder => new ContentFormat(decoder.readKey(), decoder.readJSON())
+export const readContentFormat = decoder => createContentFormat(decoder.readKey(), decoder.readJSON())
 
 /**
  * @private

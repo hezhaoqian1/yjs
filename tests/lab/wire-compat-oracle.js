@@ -1269,6 +1269,205 @@ const runWireBijectionOracle = (seed, digests) => {
 }
 
 /**
+ * Suite 5: `ContentFormat` bounded primitive flyweight safety, `cleanupFormattingGap`
+ * duplicate-marker deduplication, `obfuscateUpdate` immutability safety, and DoS cap.
+ */
+const runContentFormatFlyweightOracle = () => {
+  // 5a. Flyweight deduplication across local inserts, V1 roundtrip, and V2 roundtrip
+  {
+    const doc = new Y.Doc({ gc: false })
+    const docV1 = new Y.Doc({ gc: false })
+    const docV2 = new Y.Doc({ gc: false })
+    doc.clientID = 501
+    try {
+      const t = doc.get('text')
+      for (let i = 0; i < 40; i++) {
+        t.insert(t.length, `a${i}`, { bold: true, color: '#c00' })
+        t.insert(t.length, `b${i}`, { italic: true })
+      }
+      const u1 = Y.encodeStateAsUpdate(doc)
+      const u2 = Y.encodeStateAsUpdateV2(doc)
+      Y.applyUpdate(docV1, u1)
+      Y.applyUpdateV2(docV2, u2)
+
+      /** @param {Y.Doc} d */
+      const collectFormatContents = d => {
+        /** @type {Array<Y.ContentFormat>} */
+        const all = []
+        d.store.clients.forEach(structs => {
+          for (let i = 0; i < structs.length; i++) {
+            const s = structs[i]
+            if (s instanceof Y.Item && s.content instanceof Y.ContentFormat) {
+              all.push(s.content)
+            }
+          }
+        })
+        return all
+      }
+
+      const localCfs = collectFormatContents(doc)
+      const v1Cfs = collectFormatContents(docV1)
+      const v2Cfs = collectFormatContents(docV2)
+      assertInvariant(localCfs.length > 50, `5a: expected >50 ContentFormat items, got ${localCfs.length}`)
+      assertInvariant(v1Cfs.length === localCfs.length && v2Cfs.length === localCfs.length, '5a: ContentFormat count mismatch across V1/V2')
+
+      const uniqueAll = new Set([...localCfs, ...v1Cfs, ...v2Cfs])
+      assertInvariant(uniqueAll.size <= 6, `5a: expected <=6 distinct flyweight ContentFormat instances across local+V1+V2, got ${uniqueAll.size}`)
+      uniqueAll.forEach(cf => {
+        assertInvariant(Object.isFrozen(cf), `5a: cached ContentFormat(${cf.key}) must be frozen`)
+        assertInvariant(cf.copy() === cf, `5a: frozen ContentFormat(${cf.key}).copy() must return self`)
+      })
+
+      // Direct constructor remains mutable and produces a fresh copy
+      const manual = new Y.ContentFormat('bold', true)
+      assertInvariant(!Object.isFrozen(manual), '5a: new ContentFormat() must remain unfrozen')
+      assertInvariant(manual.copy() !== manual, '5a: unfrozen ContentFormat.copy() must allocate new instance')
+
+      // 5b. obfuscateUpdate / obfuscateUpdateV2 must not throw on frozen flyweights or mutate shared cache
+      const obf1 = Y.obfuscateUpdate(u1)
+      const obf2 = Y.obfuscateUpdateV2(u2)
+      const dObf1 = new Y.Doc({ gc: false })
+      const dObf2 = new Y.Doc({ gc: false })
+      try {
+        Y.applyUpdate(dObf1, obf1)
+        Y.applyUpdateV2(dObf2, obf2)
+        assertInvariant(Y.createContentFormat('bold', true).key === 'bold', '5b: obfuscateUpdate mutated flyweight key')
+        assertInvariant(Y.createContentFormat('bold', true).value === true, '5b: obfuscateUpdate mutated flyweight value')
+        const dReload = new Y.Doc({ gc: false })
+        try {
+          Y.applyUpdate(dReload, u1)
+          assertInvariant(dReload.get('text').toDelta().equals(t.toDelta()), '5b: original update corrupted after obfuscateUpdate')
+        } finally {
+          dReload.destroy()
+        }
+      } finally {
+        dObf1.destroy()
+        dObf2.destroy()
+      }
+    } finally {
+      doc.destroy()
+      docV1.destroy()
+      docV2.destroy()
+    }
+  }
+
+  // 5c. cleanupFormattingGap with two distinct Items sharing identical flyweight ContentFormat
+  {
+    const doc1 = new Y.Doc({ gc: false })
+    const doc2 = new Y.Doc({ gc: false })
+    doc1.clientID = 502
+    doc2.clientID = 503
+    try {
+      const t1 = doc1.get('text')
+      t1.insert(0, 'X', { bold: true })
+      t1.insert(1, 'Y', { bold: false })
+      t1.insert(2, 'Z', { bold: true })
+      Y.applyUpdate(doc2, Y.encodeStateAsUpdate(doc1))
+      // Concurrent duplicate { bold: true } markers + gap collapse via delete
+      doc1.get('text').format(1, 1, { bold: true })
+      doc2.get('text').delete(1, 1)
+      const u1 = Y.encodeStateAsUpdate(doc1)
+      const u2 = Y.encodeStateAsUpdate(doc2)
+      Y.applyUpdate(doc1, u2)
+      Y.applyUpdate(doc2, u1)
+      assertInvariant(doc1.get('text').toDelta().equals(doc2.get('text').toDelta()), '5c: concurrent format cleanup diverged')
+
+      // Direct gap collapse: 'A'(plain) + 'M'(bold:true) + 'N'(plain) + 'B'(bold:true) -> delete 'MN'
+      // With startFormats = {}, the gap [CF1(bold:true), 'M'(del), CF2(bold:null), 'N'(del), CF3(bold:true)]
+      // contains TWO live Items sharing the exact same flyweight where startFormatValue (null) !== true.
+      // Only Item-identity keying in endFormats deduplicates CF1 (content-identity keying leaves liveBoldTrue=2).
+      const doc3 = new Y.Doc({ gc: false })
+      doc3.clientID = 504
+      try {
+        const t3 = doc3.get('text')
+        t3.insert(0, 'A')
+        t3.insert(1, 'M', { bold: true })
+        t3.insert(2, 'N')
+        t3.insert(3, 'B', { bold: true })
+        /** @type {Array<Y.ContentFormat>} */
+        const boldBefore = []
+        for (let cur = t3._start; cur !== null; cur = cur.right) {
+          if (!cur.deleted && cur.content instanceof Y.ContentFormat && cur.content.key === 'bold' && cur.content.value === true) {
+            boldBefore.push(cur.content)
+          }
+        }
+        assertInvariant(boldBefore.length === 2 && boldBefore[0] === boldBefore[1], '5c: expected 2 live Items sharing same bold:true flyweight before delete')
+        t3.delete(1, 2) // deletes 'MN', collapsing both bold:true flyweight Items into one gap
+        let liveBoldTrue = 0
+        for (let cur = t3._start; cur !== null; cur = cur.right) {
+          if (!cur.deleted && cur.content instanceof Y.ContentFormat && cur.content.key === 'bold' && cur.content.value === true) {
+            liveBoldTrue++
+          }
+        }
+        assertInvariant(liveBoldTrue === 1, `5c: cleanupFormattingGap failed to deduplicate flyweight ContentFormat items (liveBoldTrue=${liveBoldTrue})`)
+        assertInvariant(t3.toDelta().equals(delta.create().insert('A').insert('B', { bold: true }).done()), '5c: unexpected delta after gap collapse')
+        verifyDocInvariants(doc3, { expectNoPending: true, label: '5c-cleanupFormattingGap' })
+      } finally {
+        doc3.destroy()
+      }
+    } finally {
+      doc1.destroy()
+      doc2.destroy()
+    }
+  }
+
+  // 5d. Non-cacheable edge values (objects, arrays, NaN, -0, undefined, >64 chars) & 512-entry DoS cap
+  {
+    const objA = Y.createContentFormat('link', { href: 'https://a' })
+    const objB = Y.createContentFormat('link', { href: 'https://a' })
+    assertInvariant(objA !== objB && !Object.isFrozen(objA), '5d: mutable object format must not be cached')
+
+    const arrA = Y.createContentFormat('tags', [1, 2])
+    const arrB = Y.createContentFormat('tags', [1, 2])
+    assertInvariant(arrA !== arrB && !Object.isFrozen(arrA), '5d: mutable array format must not be cached')
+
+    const nanA = Y.createContentFormat('n', Number.NaN)
+    const nanB = Y.createContentFormat('n', Number.NaN)
+    assertInvariant(nanA !== nanB && !Object.isFrozen(nanA), '5d: NaN format value must not be cached')
+
+    const posInfA = Y.createContentFormat('inf', Number.POSITIVE_INFINITY)
+    const posInfB = Y.createContentFormat('inf', Number.POSITIVE_INFINITY)
+    assertInvariant(posInfA !== posInfB && !Object.isFrozen(posInfA), '5d: +Infinity format value must not be cached')
+
+    const negInfA = Y.createContentFormat('ninf', Number.NEGATIVE_INFINITY)
+    const negInfB = Y.createContentFormat('ninf', Number.NEGATIVE_INFINITY)
+    assertInvariant(negInfA !== negInfB && !Object.isFrozen(negInfA), '5d: -Infinity format value must not be cached')
+
+    const negZero = Y.createContentFormat('z', -0)
+    const posZero = Y.createContentFormat('z', 0)
+    assertInvariant(negZero !== posZero && Object.is(negZero.value, -0) && Object.is(posZero.value, 0), '5d: -0 must not alias +0 in flyweight cache')
+
+    const undefA = Y.createContentFormat('u', undefined)
+    const undefB = Y.createContentFormat('u', undefined)
+    assertInvariant(undefA !== undefB && !Object.isFrozen(undefA), '5d: undefined format value must not be cached')
+
+    const longKey = 'k'.repeat(65)
+    const longVal = 'v'.repeat(65)
+    const longKeyA = Y.createContentFormat(longKey, true)
+    const longKeyB = Y.createContentFormat(longKey, true)
+    assertInvariant(longKeyA !== longKeyB && !Object.isFrozen(longKeyA), '5d: >64 char key must not be cached')
+    const longValA = Y.createContentFormat('s', longVal)
+    const longValB = Y.createContentFormat('s', longVal)
+    assertInvariant(longValA !== longValB && !Object.isFrozen(longValA), '5d: >64 char string value must not be cached')
+
+    // Bounded cap: flooding 600 unique entries must stop growing cache at 512
+    const cachedBefore = Y.createContentFormat('bold', true)
+    let unfrozenAfterCap = 0
+    for (let i = 0; i < 600; i++) {
+      const cf = Y.createContentFormat(`dos_k_${i}`, `dos_v_${i}`)
+      if (!Object.isFrozen(cf)) {
+        unfrozenAfterCap++
+      }
+    }
+    assertInvariant(unfrozenAfterCap >= 88, `5d: expected >=88 uncached entries after 512 cap, got ${unfrozenAfterCap}`)
+    assertInvariant(Y.createContentFormat('bold', true) === cachedBefore, '5d: previously cached entry must stay cached after cap reached')
+    const overflow1 = Y.createContentFormat('dos_overflow_check', 1)
+    const overflow2 = Y.createContentFormat('dos_overflow_check', 1)
+    assertInvariant(overflow1 !== overflow2 && !Object.isFrozen(overflow1), '5d: post-cap entries must not be cached')
+  }
+}
+
+/**
  * Parse CLI arguments.
  *
  * @param {Array<string>} argv
@@ -1303,7 +1502,8 @@ if (isMain) {
     { name: 'searchMarker-vs-noMarker-random-text', fn: () => runSearchMarkerOracle(args.seed, digests) },
     { name: 'direct-api-vs-applyDelta-wire-equiv', fn: () => runDirectVsApplyDeltaOracle(args.seed, digests) },
     { name: 'contentAny-cow-merge-and-aliasing', fn: () => runContentAnyCowOracle(args.seed, digests) },
-    { name: 'v1-v2-wire-bijection-and-merge-diff', fn: () => runWireBijectionOracle(args.seed, digests) }
+    { name: 'v1-v2-wire-bijection-and-merge-diff', fn: () => runWireBijectionOracle(args.seed, digests) },
+    { name: 'contentFormat-flyweight-safety-bounds', fn: () => runContentFormatFlyweightOracle() }
   ]
 
   /** @type {Array<{ name: string, passed: boolean, ms: number, error: string | null }>} */

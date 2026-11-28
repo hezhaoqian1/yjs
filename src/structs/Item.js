@@ -1200,7 +1200,7 @@ export class ContentFormat {
    * @return {ContentFormat}
    */
   copy () {
-    return new ContentFormat(this.key, this.value)
+    return Object.isFrozen(this) ? this : new ContentFormat(this.key, this.value)
   }
 
   /**
@@ -1252,6 +1252,88 @@ export class ContentFormat {
   getRef () {
     return 6
   }
+}
+
+const maxContentFormatCacheSize = 512
+const maxContentFormatStrLen = 64
+
+/**
+ * Bounded 2-level flyweight cache for primitive `(key, value)` `ContentFormat` instances.
+ *
+ * @type {Map<string, Map<any, ContentFormat>>}
+ */
+const _contentFormatCache = new Map()
+let _contentFormatCacheSize = 0
+
+/**
+ * Copy a short string into a fresh flat string so global flyweight entries never pin a
+ * multi-MB V8 SlicedString parent (e.g. from `UpdateDecoderV2.stringDecoder`).
+ * Called at most `maxContentFormatCacheSize` times per process.
+ *
+ * @param {string} s
+ * @return {string}
+ */
+const copyShortString = s => {
+  const len = s.length
+  if (len === 0) return ''
+  /** @type {Array<number>} */
+  const codes = new Array(len)
+  for (let i = 0; i < len; i++) {
+    codes[i] = s.charCodeAt(i)
+  }
+  return String.fromCharCode.apply(null, codes)
+}
+
+/**
+ * Return a frozen flyweight `ContentFormat` for bounded primitive `(key, value)` pairs,
+ * or a fresh `new ContentFormat(key, value)` for uncacheable values or once the cache cap
+ * (`512` total entries) is reached.
+ *
+ * @param {string} key
+ * @param {any} value
+ * @return {ContentFormat}
+ */
+export const createContentFormat = (key, value) => {
+  if (
+    typeof key === 'string' &&
+    key.length <= maxContentFormatStrLen &&
+    (
+      value === null ||
+      typeof value === 'boolean' ||
+      (typeof value === 'number' && Number.isFinite(value) && !Object.is(value, -0)) ||
+      (typeof value === 'string' && value.length <= maxContentFormatStrLen)
+    )
+  ) {
+    let byVal = _contentFormatCache.get(key)
+    if (byVal !== undefined) {
+      const cached = byVal.get(value)
+      if (cached !== undefined) {
+        return cached
+      }
+      if (_contentFormatCacheSize < maxContentFormatCacheSize) {
+        const ownedKey = copyShortString(key)
+        const ownedVal = typeof value === 'string' ? copyShortString(value) : value
+        const cf = new ContentFormat(ownedKey, ownedVal)
+        Object.freeze(cf)
+        byVal.set(ownedVal, cf)
+        _contentFormatCacheSize++
+        return cf
+      }
+      return new ContentFormat(key, value)
+    }
+    if (_contentFormatCacheSize < maxContentFormatCacheSize) {
+      const ownedKey = copyShortString(key)
+      const ownedVal = typeof value === 'string' ? copyShortString(value) : value
+      const cf = new ContentFormat(ownedKey, ownedVal)
+      Object.freeze(cf)
+      byVal = new Map()
+      byVal.set(ownedVal, cf)
+      _contentFormatCache.set(ownedKey, byVal)
+      _contentFormatCacheSize++
+      return cf
+    }
+  }
+  return new ContentFormat(key, value)
 }
 
 /**

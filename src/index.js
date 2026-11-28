@@ -25,7 +25,7 @@ export { createRelativePositionsFromDeltaPositions, createDeltaPositionsFromRela
 export { YNode as Node, getNodeChildren, computeModifiedFromItems, $node, $nodeAny } from './ynode.js'
 export { AbstractStruct } from './structs/AbstractStruct.js'
 export { GC } from './structs/GC.js'
-export { Item, ContentBinary, ContentDeleted, ContentDoc, ContentEmbed, ContentFormat, ContentJSON, ContentAny, ContentString, ContentType } from './structs/Item.js'
+export { Item, ContentBinary, ContentDeleted, ContentDoc, ContentEmbed, ContentFormat, createContentFormat, ContentJSON, ContentAny, ContentString, ContentType } from './structs/Item.js'
 export { Skip } from './structs/Skip.js'
 
 export * from './utils/meta.js'

@@ -400,15 +400,26 @@ export const cleanupFormattingGap = (transaction, start, curr, startFormats, cur
    */
   let end = start
   /**
-   * @type {Map<string,ContentFormat>}
+   * Maps each formatting key to the last live `ContentFormat` `Item` in the gap
+   * (keyed by `Item` identity, not `ContentFormat` reference, so flyweight `ContentFormat`
+   * instances shared by distinct `Item`s are still deduplicated).
+   * Lazily allocated only when at least one live `ContentFormat` exists in `[start, end)`.
+   *
+   * @type {Map<string,Item>|null}
    */
-  const endFormats = map.create()
+  let endFormats = null
   while (end && (!end.countable || end.deleted)) {
     if (!end.deleted && end.content.getRef() === 6) {
       const cf = /** @type {ContentFormat} */ (end.content)
-      endFormats.set(cf.key, cf)
+      if (endFormats === null) {
+        endFormats = map.create()
+      }
+      endFormats.set(cf.key, end)
     }
     end = end.right
+  }
+  if (endFormats === null) {
+    return 0
   }
   let cleanups = 0
   let reachedCurr = false
@@ -421,7 +432,7 @@ export const cleanupFormattingGap = (transaction, start, curr, startFormats, cur
       if (content.getRef() === 6) { // is ContentFormat
         const { key, value } = /** @type {ContentFormat} */ (content)
         const startFormatValue = startFormats.get(key) ?? null
-        if (endFormats.get(key) !== content || equalFormats(startFormatValue, value)) {
+        if (endFormats.get(key) !== start || equalFormats(startFormatValue, value)) {
           // Either this format is overwritten or it is not necessary because the format already existed.
           start.delete(transaction)
           transaction.cleanUps.add(start.id.client, start.id.clock, start.length)

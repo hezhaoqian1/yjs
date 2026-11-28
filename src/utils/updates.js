@@ -497,8 +497,10 @@ const createObfuscator = ({ formatting = true, subdocs = true, name = true } = {
           case ContentFormat: {
             const c = /** @type {ContentFormat} */ (content)
             if (formatting) {
-              c.key = map.setIfUndefined(formattingKeyCache, c.key, () => i + '')
-              c.value = map.setIfUndefined(formattingValueCache, c.value, () => ({ i }))
+              item.content = new ContentFormat(
+                map.setIfUndefined(formattingKeyCache, c.key, () => i + ''),
+                map.setIfUndefined(formattingValueCache, c.value, () => ({ i }))
+              )
             }
             break
           }
